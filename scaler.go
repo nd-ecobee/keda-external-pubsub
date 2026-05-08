@@ -10,6 +10,7 @@ import (
 	"cloud.google.com/go/pubsub"
 	pb "github.com/kedacore/keda/v2/pkg/scalers/externalscaler"
 )
+
 func NewPubSubScaler() *PubSubScaler {
 	ctx := context.Background()
 	podPSClient, err := pubsub.NewClient(ctx, pubsub.DetectProjectID)
@@ -51,12 +52,12 @@ func (s *PubSubScaler) getManager(meta map[string]string) (*SubscriptionManager,
 	}
 
 	// 1. s.getListener
-	listener, err := s.getListener(topicID, check)
+	listener, err := s.getListener(topicID)
 	if err != nil {
 		return nil, err
 	}
 
-	// 2. NewSubscriptionManager(..., listener.IsActive())
+	// 2. NewSubscriptionManager
 	subParts := splitGCPResource(sub)
 	if len(subParts) != 4 {
 		return nil, fmt.Errorf("subscription must be in the format 'projects/<project>/subscriptions/<sub>', got: %s", sub)
@@ -66,7 +67,7 @@ func (s *PubSubScaler) getManager(meta map[string]string) (*SubscriptionManager,
 
 	m := NewSubscriptionManager(s.promService, subProject, subID, hold, check, listener.IsActive)
 
-	// Try to store, if someone else beat us to it, return theirs
+	// Try to store
 	actual, loaded := s.managers.LoadOrStore(key, m)
 	if loaded {
 		return actual.(*SubscriptionManager), nil
@@ -75,7 +76,6 @@ func (s *PubSubScaler) getManager(meta map[string]string) (*SubscriptionManager,
 	// 3. listener.register()
 	listener.register(m.msgNotify, m.holdDuration, m.checkInterval)
 
-	// 4. return m.active (embedded in manager)
 	return m, nil
 }
 
@@ -125,8 +125,20 @@ func (s *PubSubScaler) GetMetricSpec(ctx context.Context, ref *pb.ScaledObjectRe
 	return &pb.GetMetricSpecResponse{
 		MetricSpecs: []*pb.MetricSpec{
 			{
-				MetricName: "has_pending_message",
-				TargetSize: 1,
+				MetricName:      MetricHasTriggerMessage,
+				TargetSizeFloat: 1,
+			},
+			{
+				MetricName:      MetricTopicMetricActive,
+				TargetSizeFloat: 1,
+			},
+			{
+				MetricName:      MetricSubscriptionMetricActive,
+				TargetSizeFloat: 1,
+			},
+			{
+				MetricName:      MetricHasPendingMessage,
+				TargetSizeFloat: 1,
 			},
 		},
 	}, nil
@@ -138,16 +150,36 @@ func (s *PubSubScaler) GetMetrics(ctx context.Context, req *pb.GetMetricsRequest
 		return nil, err
 	}
 
-	var val int64 = 0
-	if m.IsActive() {
-		val = 1
+	topicID := req.ScaledObjectRef.ScalerMetadata["topic"]
+	listener, err := s.getListener(topicID)
+	if err != nil {
+		return nil, err
+	}
+
+	asFloat := func(b bool) float64 {
+		if b {
+			return 1
+		}
+		return 0
 	}
 
 	return &pb.GetMetricsResponse{
 		MetricValues: []*pb.MetricValue{
 			{
-				MetricName:  "has_pending_message",
-				MetricValue: val,
+				MetricName:       MetricHasTriggerMessage,
+				MetricValueFloat: asFloat(listener.hasMsg.Load()),
+			},
+			{
+				MetricName:       MetricTopicMetricActive,
+				MetricValueFloat: asFloat(listener.lastMetricActive.Load()),
+			},
+			{
+				MetricName:       MetricSubscriptionMetricActive,
+				MetricValueFloat: asFloat(m.lastMetricActive.Load()),
+			},
+			{
+				MetricName:       MetricHasPendingMessage,
+				MetricValueFloat: asFloat(m.IsActive()),
 			},
 		},
 	}, nil

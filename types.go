@@ -9,6 +9,13 @@ import (
 	"github.com/kedacore/keda/v2/pkg/scalers/externalscaler"
 )
 
+const (
+	MetricHasTriggerMessage       = "has_trigger_message"
+	MetricTopicMetricActive       = "topic_metric_active"
+	MetricSubscriptionMetricActive = "subscription_metric_active"
+	MetricHasPendingMessage       = "has_pending_message"
+)
+
 type PubSubScaler struct {
 	externalscaler.UnimplementedExternalScalerServer
 	
@@ -52,6 +59,9 @@ type TopicListener struct {
 	active      atomic.Bool
 	hasMsg      atomic.Bool
 
+	// Cache for last known metric state
+	lastMetricActive atomic.Bool
+
 	stopCh chan struct{}
 }
 
@@ -63,6 +73,9 @@ type SubscriptionManager struct {
 	checkInterval    time.Duration
 
 	active atomic.Bool
+	
+	// Cache for last known metric state
+	lastMetricActive atomic.Bool
 
 	// Channel to receive "message arrived" pings from the listener
 	msgNotify chan struct{}

@@ -13,7 +13,7 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-func NewTopicListener(promService *PrometheusService, podPSClient *pubsub.Client, topicID string, checkInterval time.Duration) (*TopicListener, error) {
+func NewTopicListener(promService *PrometheusService, podPSClient *pubsub.Client, topicID string) (*TopicListener, error) {
 	topicParts := splitGCPResource(topicID)
 	if len(topicParts) != 4 {
 		return nil, fmt.Errorf("topic ID must be in the format 'projects/<project>/topics/<topic>', got: %s", topicID)
@@ -30,7 +30,7 @@ func NewTopicListener(promService *PrometheusService, podPSClient *pubsub.Client
 		stopCh:       make(chan struct{}),
 	}
 	l.minHoldDuration.Store(int64(5 * time.Minute))
-	l.checkInterval.Store(int64(checkInterval))
+	l.checkInterval.Store(int64(1 * time.Minute)) // Default to 1min
 
 	h := fnv.New32a()
 	podName, _ := os.Hostname()
@@ -53,7 +53,9 @@ func NewTopicListener(promService *PrometheusService, podPSClient *pubsub.Client
 	l.sub = sub
 
 	// Synchronously check state (metrics based)
-	l.active.Store(l.isActiveByMetrics())
+	isActive := l.isActiveByMetrics()
+	l.active.Store(isActive)
+	log.Printf("Topic %s initialization metric active status: %v", l.topicID, isActive)
 
 	go l.listen()
 	
@@ -67,14 +69,16 @@ func (l *TopicListener) isActiveByMetrics() bool {
 		log.Printf("Error checking publish rate in isActiveByMetrics for %s: %v", l.topicID, err)
 		return false
 	}
-	return count > 0
+	active := count > 0
+	l.lastMetricActive.Store(active)
+	return active
 }
 
 func (l *TopicListener) IsActive() bool {
 	return l.active.Load()
 }
 
-func (s *PubSubScaler) getListener(topicID string, checkInterval time.Duration) (*TopicListener, error) {
+func (s *PubSubScaler) getListener(topicID string) (*TopicListener, error) {
 	s.listenersMu.RLock()
 	if l, ok := s.listeners[topicID]; ok {
 		s.listenersMu.RUnlock()
@@ -90,7 +94,7 @@ func (s *PubSubScaler) getListener(topicID string, checkInterval time.Duration) 
 		return l, nil
 	}
 
-	l, err := NewTopicListener(s.promService, s.podPSClient, topicID, checkInterval)
+	l, err := NewTopicListener(s.promService, s.podPSClient, topicID)
 	if err != nil {
 		return nil, err
 	}

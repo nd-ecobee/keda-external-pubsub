@@ -30,7 +30,9 @@ func (m *SubscriptionManager) isActiveByMetrics() bool {
 		log.Printf("Error checking backlog in isActiveByMetrics for sub %s: %v", m.workerSubID, err)
 		return false
 	}
-	return backlog > 0
+	active := backlog > 0
+	m.lastMetricActive.Store(active)
+	return active
 }
 
 func (m *SubscriptionManager) IsActive() bool {
