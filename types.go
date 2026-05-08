@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -51,10 +50,8 @@ type TopicListener struct {
 	checkIntervalMu sync.Mutex
 
 	// State for holding a single message
-	stateMu     sync.Mutex
-	active      bool
-	purgeCtx    context.Context
-	purgeCancel context.CancelFunc
+	active      atomic.Bool
+	hasMsg      atomic.Bool
 
 	stopCh chan struct{}
 }
@@ -66,8 +63,7 @@ type SubscriptionManager struct {
 	holdDuration     time.Duration
 	checkInterval    time.Duration
 
-	active       bool
-	mu           sync.RWMutex
+	active atomic.Bool
 
 	// Channel to receive "message arrived" pings from the listener
 	msgNotify chan struct{}

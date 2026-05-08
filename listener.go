@@ -19,7 +19,6 @@ func NewTopicListener(promService *PrometheusService, podPSClient *pubsub.Client
 	topicProject := topicParts[1]
 	topicName := topicParts[3]
 
-	pCtx, pCancel := context.WithCancel(context.Background())
 	l := &TopicListener{
 		promService:  promService,
 		podProjectID: podProjectID,
@@ -27,8 +26,6 @@ func NewTopicListener(promService *PrometheusService, podPSClient *pubsub.Client
 		topicProject: topicProject,
 		topicName:    topicName,
 		stopCh:       make(chan struct{}),
-		purgeCtx:     pCtx,
-		purgeCancel:  pCancel,
 	}
 	l.minHoldDuration.Store(int64(5 * time.Minute))
 	l.checkInterval.Store(int64(checkInterval))
@@ -39,9 +36,8 @@ func NewTopicListener(promService *PrometheusService, podPSClient *pubsub.Client
 	subID := fmt.Sprintf("keda-%s-%x", topicName, h.Sum32())
 
 	ctx := context.Background()
-	topic := podPSClient.TopicInProject(topicID, topicProject)
 	sub, err := podPSClient.CreateSubscription(ctx, subID, pubsub.SubscriptionConfig{
-		Topic:            topic,
+		Topic:            podPSClient.TopicInProject(topicID, topicProject),
 		ExpirationPolicy: 24 * time.Hour,
 	})
 	if err != nil {
@@ -49,12 +45,11 @@ func NewTopicListener(promService *PrometheusService, podPSClient *pubsub.Client
 	}
 	l.sub = sub
 
-	// Synchronously check state (metrics based) without locking in New
-	l.active = l.isActiveByMetrics()
+	// Synchronously check state (metrics based)
+	l.active.Store(l.isActiveByMetrics())
 
 	go l.listen()
-	go l.purgeLoop()
-	
+
 	return l, nil
 }
 
@@ -69,9 +64,7 @@ func (l *TopicListener) isActiveByMetrics() bool {
 }
 
 func (l *TopicListener) IsActive() bool {
-	l.stateMu.Lock()
-	defer l.stateMu.Unlock()
-	return l.active
+	return l.active.Load()
 }
 
 func (s *PubSubScaler) getListener(topicID string, checkInterval time.Duration) (*TopicListener, error) {
@@ -134,11 +127,28 @@ func (l *TopicListener) listen() {
 
 	log.Printf("Starting listener for topic %s on sub %s", l.topicID, l.sub.ID())
 
+	// Background ticker for periodic deactivation checks
+	go func() {
+		for {
+			interval := time.Duration(l.checkInterval.Load())
+			select {
+			case <-l.stopCh:
+				return
+			case <-time.After(interval):
+				// Optimization: skip metric check if we are currently holding a message
+				if l.hasMsg.Load() {
+					continue
+				}
+
+				// Poll the metrics for update between purge and next message
+				l.updateActiveState()
+			}
+		}
+	}()
+
 	err := l.sub.Receive(ctx, func(ctx context.Context, msg *pubsub.Message) {
-		l.stateMu.Lock()
-		l.active = true
-		pCtx := l.purgeCtx
-		l.stateMu.Unlock()
+		l.active.Store(true)
+		l.hasMsg.Store(true)
 
 		l.notifyChannels.Range(func(key, value interface{}) bool {
 			ch := key.(chan struct{})
@@ -149,23 +159,19 @@ func (l *TopicListener) listen() {
 			return true
 		})
 
-		holdDuration := time.Duration(l.minHoldDuration.Load())
+		hold := time.Duration(l.minHoldDuration.Load())
 
-		// Keep exactly one message in the listener holding the flow-control token.
-		// We set MaxExtension to a bit more than hold duration.
-		// We nack the message at hold time or when the topic clears (pCtx canceled).
-		select {
-		case <-pCtx.Done():
-			// The purge loop has already handled setting l.active = false
-		case <-time.After(holdDuration):
-			l.stateMu.Lock()
-			// Only clear active if the topic is actually empty by metrics.
-			// If not empty, we keep l.active = true, Nack, and let the loop pull again.
-			if l.active && !l.isActiveByMetrics() {
-				l.active = false
-			}
-			l.stateMu.Unlock()
-		}
+		// The message hold: block this callback for the required duration.
+		time.Sleep(hold)
+
+		l.hasMsg.Store(false)
+
+		// 1. ALWAYS purge after hold
+		l.purge()
+
+		// 2. Update active state based on topic metrics (keep active if topic is busy)
+		l.updateActiveState()
+
 		msg.Nack()
 	})
 
@@ -174,33 +180,18 @@ func (l *TopicListener) listen() {
 	}
 }
 
-func (l *TopicListener) purgeLoop() {
-	for {
-		checkInterval := time.Duration(l.checkInterval.Load())
-		select {
-		case <-l.stopCh:
-			return
-		case <-time.After(checkInterval):
-			// If topic is inactive by metrics, purge the ephemeral sub
-			if !l.isActiveByMetrics() {
-				minHoldDuration := time.Duration(l.minHoldDuration.Load())
+func (l *TopicListener) updateActiveState() {
+	active := l.isActiveByMetrics()
+	old := l.active.Swap(active)
+	if old != active {
+		log.Printf("Topic %s active state changed to: %v", l.topicID, active)
+	}
+}
 
-				log.Printf("Topic %s publish increase is 0 over %s. Purging ephemeral listener sub.", l.topicID, minHoldDuration)
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				if err := l.sub.SeekToTime(ctx, time.Now()); err != nil {
-					log.Printf("Error purging sub %s: %v", l.sub.ID(), err)
-				}
-				cancel()
-
-				// Release the held message and prepare a new context for the next trigger
-				l.stateMu.Lock()
-				if l.active {
-					l.active = false
-					l.purgeCancel()
-					l.purgeCtx, l.purgeCancel = context.WithCancel(context.Background())
-				}
-				l.stateMu.Unlock()
-			}
-		}
+func (l *TopicListener) purge() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := l.sub.SeekToTime(ctx, time.Now()); err != nil {
+		log.Printf("Error purging sub %s: %v", l.sub.ID(), err)
 	}
 }

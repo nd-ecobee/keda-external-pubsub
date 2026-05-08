@@ -18,7 +18,7 @@ func NewSubscriptionManager(promService *PrometheusService, subProject string, s
 	}
 
 	// Synchronously populate state in New
-	m.active = isTLActive() || m.isActiveByMetrics()
+	m.active.Store(isTLActive() || m.isActiveByMetrics())
 	go m.run()
 
 	return m
@@ -34,9 +34,7 @@ func (m *SubscriptionManager) isActiveByMetrics() bool {
 }
 
 func (m *SubscriptionManager) IsActive() bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.active
+	return m.active.Load()
 }
 
 func (m *SubscriptionManager) run() {
@@ -48,13 +46,10 @@ func (m *SubscriptionManager) run() {
 		case <-m.stopCh:
 			return
 		case <-m.msgNotify:
-			m.mu.Lock()
-			if !m.active {
-				m.active = true
+			if m.active.CompareAndSwap(false, true) {
 				m.broadcast(true)
 				log.Printf("[Sub: %s] ACTIVE", m.workerSubID)
 			}
-			m.mu.Unlock()
 		case <-ticker.C:
 			m.checkDeactivation()
 		}
@@ -62,18 +57,15 @@ func (m *SubscriptionManager) run() {
 }
 
 func (m *SubscriptionManager) checkDeactivation() {
-	m.mu.Lock()
-	defer m.mu.RUnlock()
-
 	// Combine all conditions that prevent deactivation into one check.
-	// We only deactivate if we are currently active AND the topic is idle AND the metrics have cleared.
-	if !m.active || m.isTLActive() || m.isActiveByMetrics() {
+	if !m.active.Load() || m.isTLActive() || m.isActiveByMetrics() {
 		return
 	}
 
-	m.active = false
-	m.broadcast(false)
-	log.Printf("[Sub: %s] INACTIVE", m.workerSubID)
+	if m.active.CompareAndSwap(true, false) {
+		m.broadcast(false)
+		log.Printf("[Sub: %s] INACTIVE", m.workerSubID)
+	}
 }
 
 func (m *SubscriptionManager) broadcast(active bool) {
