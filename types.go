@@ -13,7 +13,7 @@ import (
 type PubSubScaler struct {
 	externalscaler.UnimplementedExternalScalerServer
 	
-	pqlClients sync.Map
+	promService *PrometheusService
 	
 	// Client for creating ephemeral subscriptions in the pod's project
 	podPSClient *pubsub.Client
@@ -27,10 +27,17 @@ type PubSubScaler struct {
 	managers sync.Map
 }
 
+type PrometheusService struct {
+	clients sync.Map
+}
+
 type TopicListener struct {
-	scaler    *PubSubScaler
-	topicName string
-	sub       *pubsub.Subscription
+	promService  *PrometheusService
+	podProjectID string
+	topicID      string // full resource name
+	topicProject string
+	topicName    string // short name
+	sub          *pubsub.Subscription
 	
 	// Channels to notify when a message arrives. Key: chan struct{}, Value: struct{}
 	notifyChannels sync.Map
@@ -41,7 +48,7 @@ type TopicListener struct {
 
 	// State for holding a single message
 	stateMu     sync.Mutex
-	isHolding   bool
+	active      bool
 	purgeCtx    context.Context
 	purgeCancel context.CancelFunc
 
@@ -49,17 +56,18 @@ type TopicListener struct {
 }
 
 type SubscriptionManager struct {
-	scaler       *PubSubScaler
-	topicName    string
-	workerSub    string
-	holdDuration time.Duration
+	promService      *PrometheusService
+	workerSubProject string
+	workerSubID      string
+	holdDuration     time.Duration
 
 	active       bool
-	firstMsgTime time.Time
 	mu           sync.RWMutex
 
 	// Channel to receive "message arrived" pings from the listener
 	msgNotify chan struct{}
+
+	isTLActive func() bool
 
 	streams sync.Map
 

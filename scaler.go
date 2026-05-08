@@ -25,6 +25,7 @@ func NewPubSubScaler() *PubSubScaler {
 	}
 
 	return &PubSubScaler{
+		promService:  NewPrometheusService(),
 		podPSClient:  podPSClient,
 		podProjectID: projectID,
 		listeners:    make(map[string]*TopicListener),
@@ -32,11 +33,11 @@ func NewPubSubScaler() *PubSubScaler {
 }
 
 func (s *PubSubScaler) getManager(meta map[string]string) (*SubscriptionManager, error) {
-	topic := meta["topic"]
+	topicID := meta["topic"]
 	sub := meta["subscription"]
 	holdStr := meta["holdDuration"]
 
-	if topic == "" || sub == "" {
+	if topicID == "" || sub == "" {
 		return nil, fmt.Errorf("topic and subscription are required in metadata")
 	}
 
@@ -45,20 +46,27 @@ func (s *PubSubScaler) getManager(meta map[string]string) (*SubscriptionManager,
 		hold = 5 * time.Minute // Default hold duration 5m
 	}
 
-	key := fmt.Sprintf("%s", topic)
+	key := fmt.Sprintf("%s|%s", topicID, sub)
 
 	if m, ok := s.managers.Load(key); ok {
 		return m.(*SubscriptionManager), nil
 	}
 
-	m := &SubscriptionManager{
-		scaler:       s,
-		topicName:    topic,
-		workerSub:    sub,
-		holdDuration: hold,
-		msgNotify:    make(chan struct{}, 1),
-		stopCh:       make(chan struct{}),
+	// 1. s.getListener
+	listener, err := s.getListener(topicID)
+	if err != nil {
+		return nil, err
 	}
+
+	// 2. NewSubscriptionManager(..., listener.IsActive())
+	subParts := splitGCPResource(sub)
+	if len(subParts) != 4 {
+		return nil, fmt.Errorf("subscription must be in the format 'projects/<project>/subscriptions/<sub>', got: %s", sub)
+	}
+	subProject := subParts[1]
+	subID := subParts[3]
+
+	m := NewSubscriptionManager(s.promService, subProject, subID, hold, listener.IsActive(), listener.IsActive)
 
 	// Try to store, if someone else beat us to it, return theirs
 	actual, loaded := s.managers.LoadOrStore(key, m)
@@ -66,15 +74,10 @@ func (s *PubSubScaler) getManager(meta map[string]string) (*SubscriptionManager,
 		return actual.(*SubscriptionManager), nil
 	}
 
-	listener, err := s.getListener(topic)
-	if err != nil {
-		// Clean up if listener creation fails
-		s.managers.Delete(key)
-		return nil, err
-	}
+	// 3. listener.register()
 	listener.register(m.msgNotify, m.holdDuration)
 
-	go m.run()
+	// 4. return m.active (embedded in manager)
 	return m, nil
 }
 
@@ -87,9 +90,7 @@ func (s *PubSubScaler) IsActive(ctx context.Context, ref *pb.ScaledObjectRef) (*
 	if err != nil {
 		return nil, err
 	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return &pb.IsActiveResponse{Result: m.active}, nil
+	return &pb.IsActiveResponse{Result: m.IsActive()}, nil
 }
 
 func (s *PubSubScaler) StreamIsActive(ref *pb.ScaledObjectRef, stream pb.ExternalScaler_StreamIsActiveServer) error {
@@ -105,9 +106,7 @@ func (s *PubSubScaler) StreamIsActive(ref *pb.ScaledObjectRef, stream pb.Externa
 		m.streams.Delete(ch)
 	}()
 
-	m.mu.RLock()
-	initialActive := m.active
-	m.mu.RUnlock()
+	initialActive := m.IsActive()
 	if err := stream.Send(&pb.IsActiveResponse{Result: initialActive}); err != nil {
 		return err
 	}
@@ -141,11 +140,9 @@ func (s *PubSubScaler) GetMetrics(ctx context.Context, req *pb.GetMetricsRequest
 		return nil, err
 	}
 
-	// Fetch actual backlog from PQL
-	val, err := s.getWorkerBacklogPQL(m)
-	if err != nil {
-		log.Printf("Error fetching backlog for %s: %v", m.workerSub, err)
-		val = 0
+	var val int64 = 0
+	if m.IsActive() {
+		val = 1
 	}
 
 	return &pb.GetMetricsResponse{

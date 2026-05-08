@@ -49,36 +49,30 @@ func NewPQLClient(projectID string) v1.API {
 	return v1.NewAPI(client)
 }
 
-func (s *PubSubScaler) getPQLClient(projectID string) v1.API {
-	if c, ok := s.pqlClients.Load(projectID); ok {
+func NewPrometheusService() *PrometheusService {
+	return &PrometheusService{}
+}
+
+func (s *PrometheusService) getClient(projectID string) v1.API {
+	if c, ok := s.clients.Load(projectID); ok {
 		return c.(v1.API)
 	}
 	c := NewPQLClient(projectID)
-	actual, _ := s.pqlClients.LoadOrStore(projectID, c)
+	actual, _ := s.clients.LoadOrStore(projectID, c)
 	return actual.(v1.API)
 }
 
-func (s *PubSubScaler) getWorkerBacklogPQL(m *SubscriptionManager) (int64, error) {
-	subID := m.workerSub
-	subParts := splitGCPResource(m.workerSub)
-	projectID := s.podProjectID
-	if len(subParts) >= 4 {
-		projectID = subParts[1]
-		subID = subParts[3]
-	}
-
-	// Use max_over_time over the holdDuration to ensure it has been 0 consistently.
-	// This implements the requirement: "backlog is 0 for at least hold duration"
+func (s *PrometheusService) GetWorkerBacklog(projectID, subID string, holdDuration time.Duration) (int64, error) {
 	query := fmt.Sprintf(
 		"max_over_time({__name__=\"pubsub.googleapis.com/subscription/num_undelivered_messages\", monitored_resource=\"pubsub_subscription\", subscription_id=\"%s\"}[%s])",
 		subID,
-		m.holdDuration.String(),
+		holdDuration.String(),
 	)
 	
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	val, _, err := s.getPQLClient(projectID).Query(ctx, query, time.Now())
+	val, _, err := s.getClient(projectID).Query(ctx, query, time.Now())
 	if err != nil {
 		return -1, err
 	}
@@ -95,18 +89,7 @@ func (s *PubSubScaler) getWorkerBacklogPQL(m *SubscriptionManager) (int64, error
 	return int64(vector[0].Value), nil
 }
 
-func (s *PubSubScaler) getTopicPublishRatePQL(topicName string, holdDuration time.Duration) (float64, error) {
-	topicParts := splitGCPResource(topicName)
-	var topicID string
-	projectID := s.podProjectID
-	if len(topicParts) >= 4 {
-		projectID = topicParts[1]
-		topicID = topicParts[3]
-	} else {
-		topicID = topicName
-	}
-
-	// PromQL to get the total increase of published messages over the hold duration
+func (s *PrometheusService) GetTopicPublishRate(projectID, topicID string, holdDuration time.Duration) (float64, error) {
 	query := fmt.Sprintf(
 		"sum(increase({__name__=\"pubsub.googleapis.com/topic/send_request_count\", monitored_resource=\"pubsub_topic\", topic_id=\"%s\"}[%s]))",
 		topicID,
@@ -116,7 +99,7 @@ func (s *PubSubScaler) getTopicPublishRatePQL(topicName string, holdDuration tim
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	val, _, err := s.getPQLClient(projectID).Query(ctx, query, time.Now())
+	val, _, err := s.getClient(projectID).Query(ctx, query, time.Now())
 	if err != nil {
 		return -1, err
 	}

@@ -5,12 +5,42 @@ import (
 	"time"
 )
 
+func NewSubscriptionManager(promService *PrometheusService, subProject string, subID string, hold time.Duration, listenerActive bool, isTLActive func() bool) *SubscriptionManager {
+	m := &SubscriptionManager{
+		promService:      promService,
+		workerSubProject: subProject,
+		workerSubID:      subID,
+		holdDuration:     hold,
+		msgNotify:        make(chan struct{}, 1),
+		isTLActive:       isTLActive,
+		stopCh:           make(chan struct{}),
+	}
+
+	// Synchronously populate state in New
+	m.active = listenerActive || m.isActiveByMetrics()
+	go m.run()
+
+	return m
+}
+
+func (m *SubscriptionManager) isActiveByMetrics() bool {
+	backlog, err := m.promService.GetWorkerBacklog(m.workerSubProject, m.workerSubID, m.holdDuration)
+	if err != nil {
+		log.Printf("Error checking backlog in isActiveByMetrics for sub %s: %v", m.workerSubID, err)
+		return false
+	}
+	return backlog > 0
+}
+
+func (m *SubscriptionManager) IsActive() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.active
+}
+
 func (m *SubscriptionManager) run() {
-	// Initial ticker for deactivation checks
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
-
-	var timerCh <-chan time.Time
 
 	for {
 		select {
@@ -20,20 +50,11 @@ func (m *SubscriptionManager) run() {
 			m.mu.Lock()
 			if !m.active {
 				m.active = true
-				m.firstMsgTime = time.Now()
 				m.broadcast(true)
-				log.Printf("[Topic: %s | Sub: %s] ACTIVE. Hold duration: %s", m.topicName, m.workerSub, m.holdDuration)
-				
-				// Set a timer to wake up exactly when the hold duration expires
-				timerCh = time.After(m.holdDuration)
+				log.Printf("[Sub: %s] ACTIVE", m.workerSubID)
 			}
 			m.mu.Unlock()
-		case <-timerCh:
-			// Hold duration reached! Check immediately.
-			m.checkDeactivation()
-			timerCh = nil // Reset so we don't trigger again until next activation
 		case <-ticker.C:
-			// Periodic check in case backlog was not zero at the exact moment of timer expiry
 			m.checkDeactivation()
 		}
 	}
@@ -41,30 +62,17 @@ func (m *SubscriptionManager) run() {
 
 func (m *SubscriptionManager) checkDeactivation() {
 	m.mu.Lock()
-	if !m.active {
-		m.mu.Unlock()
+	defer m.mu.RUnlock()
+
+	// Combine all conditions that prevent deactivation into one check.
+	// We only deactivate if we are currently active AND the topic is idle AND the metrics have cleared.
+	if !m.active || m.isTLActive() || m.isActiveByMetrics() {
 		return
 	}
 
-	if time.Since(m.firstMsgTime) < m.holdDuration {
-		m.mu.Unlock()
-		return
-	}
-	m.mu.Unlock()
-
-	backlog, err := m.scaler.getWorkerBacklogPQL(m)
-	if err != nil {
-		log.Printf("Error checking backlog for %s: %v", m.workerSub, err)
-		return
-	}
-
-	if backlog == 0 {
-		m.mu.Lock()
-		m.active = false
-		m.broadcast(false)
-		log.Printf("[Topic: %s | Sub: %s] INACTIVE", m.topicName, m.workerSub)
-		m.mu.Unlock()
-	}
+	m.active = false
+	m.broadcast(false)
+	log.Printf("[Sub: %s] INACTIVE", m.workerSubID)
 }
 
 func (m *SubscriptionManager) broadcast(active bool) {
