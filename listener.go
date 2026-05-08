@@ -34,7 +34,6 @@ func (s *PubSubScaler) getListener(topicName string) (*TopicListener, error) {
 	l := &TopicListener{
 		scaler:    s,
 		topicName: topicName,
-		observers: make(map[*SubscriptionManager]struct{}),
 		stopCh:    make(chan struct{}),
 	}
 
@@ -61,10 +60,14 @@ func (s *PubSubScaler) getListener(topicName string) (*TopicListener, error) {
 	return l, nil
 }
 
-func (l *TopicListener) register(m *SubscriptionManager) {
-	l.observersMu.Lock()
-	defer l.observersMu.Unlock()
-	l.observers[m] = struct{}{}
+func (l *TopicListener) register(notifyCh chan struct{}, holdDuration time.Duration) {
+	l.notifyChannels.Store(notifyCh, struct{}{})
+
+	l.minHoldDurationMu.Lock()
+	defer l.minHoldDurationMu.Unlock()
+	if l.minHoldDuration == 0 || holdDuration < l.minHoldDuration {
+		l.minHoldDuration = holdDuration
+	}
 }
 
 func (l *TopicListener) listen() {
@@ -74,16 +77,16 @@ func (l *TopicListener) listen() {
 	l.sub.ReceiveSettings.Synchronous = true
 
 	log.Printf("Starting listener for topic %s on sub %s", l.topicName, l.sub.ID())
-	
+
 	err := l.sub.Receive(ctx, func(ctx context.Context, msg *pubsub.Message) {
-		l.observersMu.RLock()
-		for m := range l.observers {
+		l.notifyChannels.Range(func(key, value interface{}) bool {
+			ch := key.(chan struct{})
 			select {
-			case m.msgNotify <- struct{}{}:
+			case ch <- struct{}{}:
 			default:
 			}
-		}
-		l.observersMu.RUnlock()
+			return true
+		})
 		// DO NOT ACK. Rely on the purge loop to clear messages when the topic is idle by metrics.
 	})
 
@@ -102,27 +105,26 @@ func (l *TopicListener) purgeLoop() {
 		case <-l.stopCh:
 			return
 		case <-ticker.C:
-			// Determine the maximum hold duration among all observers
-			l.observersMu.RLock()
-			holdDuration := 5 * time.Minute // default minimum
-			for m := range l.observers {
-				if m.holdDuration > holdDuration {
-					holdDuration = m.holdDuration
-				}
-			}
-			l.observersMu.RUnlock()
+			l.minHoldDurationMu.Lock()
+			minHoldDuration := l.minHoldDuration
+			l.minHoldDurationMu.Unlock()
 
-			count, err := l.scaler.getTopicPublishRatePQL(l.topicName, holdDuration)
+			if minHoldDuration == 0 {
+				// No observers registered yet, use a default fallback
+				minHoldDuration = 5 * time.Minute
+			}
+
+			count, err := l.scaler.getTopicPublishRatePQL(l.topicName, minHoldDuration)
 			if err != nil {
 				log.Printf("Error checking publish rate for %s: %v", l.topicName, err)
 				continue
 			}
 
-			// If publish count is 0 over the holdDuration, purge the ephemeral sub
+			// If publish count is 0 over the minHoldDuration, purge the ephemeral sub
 			// This clears out any old messages that might be stuck if the pod was down
 			// while the topic was inactive.
 			if count == 0 {
-				log.Printf("Topic %s publish increase is 0 over %s. Purging ephemeral listener sub.", l.topicName, holdDuration)
+				log.Printf("Topic %s publish increase is 0 over %s. Purging ephemeral listener sub.", l.topicName, minHoldDuration)
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				if err := l.sub.SeekToTime(ctx, time.Now()); err != nil {
 					log.Printf("Error purging sub %s: %v", l.sub.ID(), err)

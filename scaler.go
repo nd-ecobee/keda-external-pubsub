@@ -72,7 +72,7 @@ func (s *PubSubScaler) getManager(meta map[string]string) (*SubscriptionManager,
 		s.managers.Delete(key)
 		return nil, err
 	}
-	listener.register(m)
+	listener.register(m.msgNotify, m.holdDuration)
 
 	go m.run()
 	return m, nil

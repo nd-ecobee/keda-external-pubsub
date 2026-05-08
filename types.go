@@ -30,9 +30,12 @@ type TopicListener struct {
 	topicName string
 	sub       *pubsub.Subscription
 	
-	// Managers interested in this topic
-	observers   map[*SubscriptionManager]struct{}
-	observersMu sync.RWMutex
+	// Channels to notify when a message arrives. Key: chan struct{}, Value: struct{}
+	notifyChannels sync.Map
+
+	// The minimum hold duration among all registered observers
+	minHoldDuration   time.Duration
+	minHoldDurationMu sync.Mutex
 
 	stopCh chan struct{}
 }
