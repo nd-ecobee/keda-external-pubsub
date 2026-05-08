@@ -5,19 +5,20 @@ import (
 	"time"
 )
 
-func NewSubscriptionManager(promService *PrometheusService, subProject string, subID string, hold time.Duration, listenerActive bool, isTLActive func() bool) *SubscriptionManager {
+func NewSubscriptionManager(promService *PrometheusService, subProject string, subID string, hold time.Duration, check time.Duration, isTLActive func() bool) *SubscriptionManager {
 	m := &SubscriptionManager{
 		promService:      promService,
 		workerSubProject: subProject,
 		workerSubID:      subID,
 		holdDuration:     hold,
+		checkInterval:    check,
 		msgNotify:        make(chan struct{}, 1),
 		isTLActive:       isTLActive,
 		stopCh:           make(chan struct{}),
 	}
 
 	// Synchronously populate state in New
-	m.active = listenerActive || m.isActiveByMetrics()
+	m.active = isTLActive() || m.isActiveByMetrics()
 	go m.run()
 
 	return m
@@ -39,7 +40,7 @@ func (m *SubscriptionManager) IsActive() bool {
 }
 
 func (m *SubscriptionManager) run() {
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(m.checkInterval)
 	defer ticker.Stop()
 
 	for {

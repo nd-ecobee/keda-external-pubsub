@@ -36,6 +36,7 @@ func (s *PubSubScaler) getManager(meta map[string]string) (*SubscriptionManager,
 	topicID := meta["topic"]
 	sub := meta["subscription"]
 	holdStr := meta["holdDuration"]
+	checkStr := meta["checkInterval"]
 
 	if topicID == "" || sub == "" {
 		return nil, fmt.Errorf("topic and subscription are required in metadata")
@@ -46,6 +47,11 @@ func (s *PubSubScaler) getManager(meta map[string]string) (*SubscriptionManager,
 		hold = 5 * time.Minute // Default hold duration 5m
 	}
 
+	check, err := time.ParseDuration(checkStr)
+	if err != nil {
+		check = 1 * time.Minute // Default check interval 1m
+	}
+
 	key := fmt.Sprintf("%s|%s", topicID, sub)
 
 	if m, ok := s.managers.Load(key); ok {
@@ -53,7 +59,7 @@ func (s *PubSubScaler) getManager(meta map[string]string) (*SubscriptionManager,
 	}
 
 	// 1. s.getListener
-	listener, err := s.getListener(topicID)
+	listener, err := s.getListener(topicID, check)
 	if err != nil {
 		return nil, err
 	}
@@ -66,7 +72,7 @@ func (s *PubSubScaler) getManager(meta map[string]string) (*SubscriptionManager,
 	subProject := subParts[1]
 	subID := subParts[3]
 
-	m := NewSubscriptionManager(s.promService, subProject, subID, hold, listener.IsActive(), listener.IsActive)
+	m := NewSubscriptionManager(s.promService, subProject, subID, hold, check, listener.IsActive)
 
 	// Try to store, if someone else beat us to it, return theirs
 	actual, loaded := s.managers.LoadOrStore(key, m)
@@ -75,7 +81,7 @@ func (s *PubSubScaler) getManager(meta map[string]string) (*SubscriptionManager,
 	}
 
 	// 3. listener.register()
-	listener.register(m.msgNotify, m.holdDuration)
+	listener.register(m.msgNotify, m.holdDuration, m.checkInterval)
 
 	// 4. return m.active (embedded in manager)
 	return m, nil

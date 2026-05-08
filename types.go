@@ -46,6 +46,10 @@ type TopicListener struct {
 	minHoldDuration   atomic.Int64
 	minHoldDurationMu sync.Mutex
 
+	// The minimum check interval among all registered observers
+	checkInterval   atomic.Int64
+	checkIntervalMu sync.Mutex
+
 	// State for holding a single message
 	stateMu     sync.Mutex
 	active      bool
@@ -60,6 +64,7 @@ type SubscriptionManager struct {
 	workerSubProject string
 	workerSubID      string
 	holdDuration     time.Duration
+	checkInterval    time.Duration
 
 	active       bool
 	mu           sync.RWMutex

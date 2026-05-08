@@ -11,7 +11,7 @@ import (
 	"cloud.google.com/go/pubsub"
 )
 
-func NewTopicListener(promService *PrometheusService, podPSClient *pubsub.Client, podProjectID string, topicID string) (*TopicListener, error) {
+func NewTopicListener(promService *PrometheusService, podPSClient *pubsub.Client, podProjectID string, topicID string, checkInterval time.Duration) (*TopicListener, error) {
 	topicParts := splitGCPResource(topicID)
 	if len(topicParts) != 4 {
 		return nil, fmt.Errorf("topic ID must be in the format 'projects/<project>/topics/<topic>', got: %s", topicID)
@@ -31,6 +31,7 @@ func NewTopicListener(promService *PrometheusService, podPSClient *pubsub.Client
 		purgeCancel:  pCancel,
 	}
 	l.minHoldDuration.Store(int64(5 * time.Minute))
+	l.checkInterval.Store(int64(checkInterval))
 
 	h := fnv.New32a()
 	podName, _ := os.Hostname()
@@ -38,7 +39,7 @@ func NewTopicListener(promService *PrometheusService, podPSClient *pubsub.Client
 	subID := fmt.Sprintf("keda-%s-%x", topicName, h.Sum32())
 
 	ctx := context.Background()
-	topic := podPSClient.TopicInProject(topicName, topicProject)
+	topic := podPSClient.TopicInProject(topicID, topicProject)
 	sub, err := podPSClient.CreateSubscription(ctx, subID, pubsub.SubscriptionConfig{
 		Topic:            topic,
 		ExpirationPolicy: 24 * time.Hour,
@@ -73,7 +74,7 @@ func (l *TopicListener) IsActive() bool {
 	return l.active
 }
 
-func (s *PubSubScaler) getListener(topicID string) (*TopicListener, error) {
+func (s *PubSubScaler) getListener(topicID string, checkInterval time.Duration) (*TopicListener, error) {
 	s.listenersMu.RLock()
 	if l, ok := s.listeners[topicID]; ok {
 		s.listenersMu.RUnlock()
@@ -89,7 +90,7 @@ func (s *PubSubScaler) getListener(topicID string) (*TopicListener, error) {
 		return l, nil
 	}
 
-	l, err := NewTopicListener(s.promService, s.podPSClient, s.podProjectID, topicID)
+	l, err := NewTopicListener(s.promService, s.podPSClient, s.podProjectID, topicID, checkInterval)
 	if err != nil {
 		return nil, err
 	}
@@ -98,17 +99,29 @@ func (s *PubSubScaler) getListener(topicID string) (*TopicListener, error) {
 	return l, nil
 }
 
-func (l *TopicListener) register(notifyCh chan struct{}, holdDuration time.Duration) {
+func (l *TopicListener) register(notifyCh chan struct{}, holdDuration time.Duration, checkInterval time.Duration) {
 	l.notifyChannels.Store(notifyCh, struct{}{})
 
 	// Ensure we use the minimum requested duration across all observers,
 	// but never go below an absolute floor of 30 seconds.
 	l.minHoldDurationMu.Lock()
-	defer l.minHoldDurationMu.Unlock()
-
 	currentMin := time.Duration(l.minHoldDuration.Load())
 	effectiveHold := max(30*time.Second, holdDuration)
 	l.minHoldDuration.Store(int64(min(currentMin, effectiveHold)))
+	l.minHoldDurationMu.Unlock()
+
+	l.checkIntervalMu.Lock()
+	currentCheck := time.Duration(l.checkInterval.Load())
+	l.checkInterval.Store(int64(min(currentCheck, checkInterval)))
+	l.checkIntervalMu.Unlock()
+
+	// If currently active, immediately notify the new observer
+	if l.IsActive() {
+		select {
+		case notifyCh <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func (l *TopicListener) listen() {
@@ -143,9 +156,12 @@ func (l *TopicListener) listen() {
 		// We nack the message at hold time or when the topic clears (pCtx canceled).
 		select {
 		case <-pCtx.Done():
+			// The purge loop has already handled setting l.active = false
 		case <-time.After(holdDuration):
 			l.stateMu.Lock()
-			if l.active {
+			// Only clear active if the topic is actually empty by metrics.
+			// If not empty, we keep l.active = true, Nack, and let the loop pull again.
+			if l.active && !l.isActiveByMetrics() {
 				l.active = false
 			}
 			l.stateMu.Unlock()
@@ -159,25 +175,16 @@ func (l *TopicListener) listen() {
 }
 
 func (l *TopicListener) purgeLoop() {
-	// Check every 1 minute if the topic has any publish activity
-	ticker := time.NewTicker(1 * time.Minute)
-	defer ticker.Stop()
-
 	for {
+		checkInterval := time.Duration(l.checkInterval.Load())
 		select {
 		case <-l.stopCh:
 			return
-		case <-ticker.C:
-			minHoldDuration := time.Duration(l.minHoldDuration.Load())
+		case <-time.After(checkInterval):
+			// If topic is inactive by metrics, purge the ephemeral sub
+			if !l.isActiveByMetrics() {
+				minHoldDuration := time.Duration(l.minHoldDuration.Load())
 
-			count, err := l.promService.GetTopicPublishRate(l.topicProject, l.topicName, minHoldDuration)
-			if err != nil {
-				log.Printf("Error checking publish rate for %s: %v", l.topicID, err)
-				continue
-			}
-
-			// If publish count is 0 over the minHoldDuration, purge the ephemeral sub
-			if count == 0 {
 				log.Printf("Topic %s publish increase is 0 over %s. Purging ephemeral listener sub.", l.topicID, minHoldDuration)
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				if err := l.sub.SeekToTime(ctx, time.Now()); err != nil {
