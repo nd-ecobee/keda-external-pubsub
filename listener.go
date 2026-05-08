@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"cloud.google.com/go/pubsub"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func NewTopicListener(promService *PrometheusService, podPSClient *pubsub.Client, topicID string, checkInterval time.Duration) (*TopicListener, error) {
@@ -36,12 +38,16 @@ func NewTopicListener(promService *PrometheusService, podPSClient *pubsub.Client
 	subID := fmt.Sprintf("keda-%s-%x", topicName, h.Sum32())
 
 	ctx := context.Background()
-	topic := podPSClient.TopicInProject(topicID, topicProject)
+	topic := podPSClient.TopicInProject(topicName, topicProject)
 	sub, err := podPSClient.CreateSubscription(ctx, subID, pubsub.SubscriptionConfig{
 		Topic:            topic,
 		ExpirationPolicy: 24 * time.Hour,
 	})
 	if err != nil {
+		st, ok := status.FromError(err)
+		if !ok || st.Code() != codes.AlreadyExists {
+			log.Printf("Warning: failed to create subscription %s, falling back to existing: %v", subID, err)
+		}
 		sub = podPSClient.Subscription(subID)
 	}
 	l.sub = sub
@@ -177,6 +183,11 @@ func (l *TopicListener) listen() {
 	})
 
 	if err != nil {
+		st, ok := status.FromError(err)
+		if ok && st.Code() == codes.NotFound {
+			log.Printf("Topic or subscription not found for %s: %v. Stopping listener.", l.topicID, err)
+			return
+		}
 		log.Fatalf("CRITICAL: Receive error for topic %s: %v. Crashing pod for restart.", l.topicID, err)
 	}
 }
