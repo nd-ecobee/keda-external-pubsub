@@ -4,31 +4,23 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"os"
 	"strings"
 	"time"
 
 	"cloud.google.com/go/pubsub"
 	pb "github.com/kedacore/keda/v2/pkg/scalers/externalscaler"
 )
-
 func NewPubSubScaler() *PubSubScaler {
-	projectID := os.Getenv("GCP_PROJECT_ID")
-	if projectID == "" {
-		projectID = os.Getenv("GOOGLE_CLOUD_PROJECT")
-	}
-
 	ctx := context.Background()
-	podPSClient, err := pubsub.NewClient(ctx, projectID)
+	podPSClient, err := pubsub.NewClient(ctx, pubsub.DetectProjectID)
 	if err != nil {
 		log.Fatalf("failed to create pubsub client: %v", err)
 	}
 
 	return &PubSubScaler{
-		promService:  NewPrometheusService(),
-		podPSClient:  podPSClient,
-		podProjectID: projectID,
-		listeners:    make(map[string]*TopicListener),
+		promService: NewPrometheusService(),
+		podPSClient: podPSClient,
+		listeners:   make(map[string]*TopicListener),
 	}
 }
 

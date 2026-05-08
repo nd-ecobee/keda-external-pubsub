@@ -16,7 +16,6 @@ type PubSubScaler struct {
 	
 	// Client for creating ephemeral subscriptions in the pod's project
 	podPSClient *pubsub.Client
-	podProjectID string
 
 	// Listeners handle the actual StreamingPull from a topic (shared per topic)
 	listeners   map[string]*TopicListener
@@ -32,7 +31,7 @@ type PrometheusService struct {
 
 type TopicListener struct {
 	promService  *PrometheusService
-	podProjectID string
+	podPSClient  *pubsub.Client
 	topicID      string // full resource name
 	topicProject string
 	topicName    string // short name

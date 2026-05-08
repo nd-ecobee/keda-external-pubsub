@@ -11,7 +11,7 @@ import (
 	"cloud.google.com/go/pubsub"
 )
 
-func NewTopicListener(promService *PrometheusService, podPSClient *pubsub.Client, podProjectID string, topicID string, checkInterval time.Duration) (*TopicListener, error) {
+func NewTopicListener(promService *PrometheusService, podPSClient *pubsub.Client, topicID string, checkInterval time.Duration) (*TopicListener, error) {
 	topicParts := splitGCPResource(topicID)
 	if len(topicParts) != 4 {
 		return nil, fmt.Errorf("topic ID must be in the format 'projects/<project>/topics/<topic>', got: %s", topicID)
@@ -21,7 +21,7 @@ func NewTopicListener(promService *PrometheusService, podPSClient *pubsub.Client
 
 	l := &TopicListener{
 		promService:  promService,
-		podProjectID: podProjectID,
+		podPSClient:  podPSClient,
 		topicID:      topicID,
 		topicProject: topicProject,
 		topicName:    topicName,
@@ -36,8 +36,9 @@ func NewTopicListener(promService *PrometheusService, podPSClient *pubsub.Client
 	subID := fmt.Sprintf("keda-%s-%x", topicName, h.Sum32())
 
 	ctx := context.Background()
+	topic := podPSClient.TopicInProject(topicID, topicProject)
 	sub, err := podPSClient.CreateSubscription(ctx, subID, pubsub.SubscriptionConfig{
-		Topic:            podPSClient.TopicInProject(topicID, topicProject),
+		Topic:            topic,
 		ExpirationPolicy: 24 * time.Hour,
 	})
 	if err != nil {
@@ -49,7 +50,7 @@ func NewTopicListener(promService *PrometheusService, podPSClient *pubsub.Client
 	l.active.Store(l.isActiveByMetrics())
 
 	go l.listen()
-
+	
 	return l, nil
 }
 
@@ -83,7 +84,7 @@ func (s *PubSubScaler) getListener(topicID string, checkInterval time.Duration) 
 		return l, nil
 	}
 
-	l, err := NewTopicListener(s.promService, s.podPSClient, s.podProjectID, topicID, checkInterval)
+	l, err := NewTopicListener(s.promService, s.podPSClient, topicID, checkInterval)
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +161,7 @@ func (l *TopicListener) listen() {
 		})
 
 		hold := time.Duration(l.minHoldDuration.Load())
-
+		
 		// The message hold: block this callback for the required duration.
 		time.Sleep(hold)
 
