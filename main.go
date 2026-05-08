@@ -20,7 +20,12 @@ func main() {
 		port = "9090"
 	}
 
-	address := fmt.Sprintf(":%s", port)
+	host := os.Getenv("HOST")
+	if host == "" {
+		host = "127.0.0.1"
+	}
+
+	address := fmt.Sprintf("%s:%s", host, port)
 	lis, err := net.Listen("tcp", address)
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
