@@ -31,11 +31,15 @@ func (s *PubSubScaler) getListener(topicName string) (*TopicListener, error) {
 	var topicProject string
 	fmt.Sscanf(topicName, "projects/%s/topics/", &topicProject)
 
+	pCtx, pCancel := context.WithCancel(context.Background())
 	l := &TopicListener{
-		scaler:    s,
-		topicName: topicName,
-		stopCh:    make(chan struct{}),
+		scaler:      s,
+		topicName:   topicName,
+		stopCh:      make(chan struct{}),
+		purgeCtx:    pCtx,
+		purgeCancel: pCancel,
 	}
+	l.minHoldDuration.Store(int64(5 * time.Minute))
 
 	h := fnv.New32a()
 	h.Write([]byte(topicName))
@@ -64,21 +68,41 @@ func (l *TopicListener) register(notifyCh chan struct{}, holdDuration time.Durat
 	l.notifyChannels.Store(notifyCh, struct{}{})
 
 	l.minHoldDurationMu.Lock()
-	defer l.minHoldDurationMu.Unlock()
-	if l.minHoldDuration == 0 || holdDuration < l.minHoldDuration {
-		l.minHoldDuration = holdDuration
+	currentMin := time.Duration(l.minHoldDuration.Load())
+	if currentMin == 0 || holdDuration < currentMin {
+		l.minHoldDuration.Store(int64(holdDuration))
 	}
+	l.minHoldDurationMu.Unlock()
+
+	// If currently holding a message (topic is active), immediately notify the new observer
+	l.stateMu.Lock()
+	if l.isHolding {
+		select {
+		case notifyCh <- struct{}{}:
+		default:
+		}
+	}
+	l.stateMu.Unlock()
 }
 
 func (l *TopicListener) listen() {
 	ctx := context.Background()
+
+	extDuration := time.Duration(l.minHoldDuration.Load())
+
 	l.sub.ReceiveSettings.MaxOutstandingMessages = 1
 	l.sub.ReceiveSettings.NumGoroutines = 1
 	l.sub.ReceiveSettings.Synchronous = true
+	l.sub.ReceiveSettings.MaxExtension = extDuration + 1*time.Minute
 
 	log.Printf("Starting listener for topic %s on sub %s", l.topicName, l.sub.ID())
 
 	err := l.sub.Receive(ctx, func(ctx context.Context, msg *pubsub.Message) {
+		l.stateMu.Lock()
+		l.isHolding = true
+		pCtx := l.purgeCtx
+		l.stateMu.Unlock()
+
 		l.notifyChannels.Range(func(key, value interface{}) bool {
 			ch := key.(chan struct{})
 			select {
@@ -87,7 +111,22 @@ func (l *TopicListener) listen() {
 			}
 			return true
 		})
-		// DO NOT ACK. Rely on the purge loop to clear messages when the topic is idle by metrics.
+
+		holdDuration := time.Duration(l.minHoldDuration.Load())
+
+		// Keep exactly one message in the listener holding the flow-control token.
+		// We set MaxExtension to a bit more than hold duration.
+		// We nack the message at hold time or when the topic clears (pCtx canceled).
+		select {
+		case <-pCtx.Done():
+		case <-time.After(holdDuration):
+			l.stateMu.Lock()
+			if l.isHolding {
+				l.isHolding = false
+			}
+			l.stateMu.Unlock()
+		}
+		msg.Nack()
 	})
 
 	if err != nil {
@@ -105,14 +144,7 @@ func (l *TopicListener) purgeLoop() {
 		case <-l.stopCh:
 			return
 		case <-ticker.C:
-			l.minHoldDurationMu.Lock()
-			minHoldDuration := l.minHoldDuration
-			l.minHoldDurationMu.Unlock()
-
-			if minHoldDuration == 0 {
-				// No observers registered yet, use a default fallback
-				minHoldDuration = 5 * time.Minute
-			}
+			minHoldDuration := time.Duration(l.minHoldDuration.Load())
 
 			count, err := l.scaler.getTopicPublishRatePQL(l.topicName, minHoldDuration)
 			if err != nil {
@@ -130,6 +162,15 @@ func (l *TopicListener) purgeLoop() {
 					log.Printf("Error purging sub %s: %v", l.sub.ID(), err)
 				}
 				cancel()
+
+				// Release the held message and prepare a new context for the next trigger
+				l.stateMu.Lock()
+				if l.isHolding {
+					l.isHolding = false
+					l.purgeCancel()
+					l.purgeCtx, l.purgeCancel = context.WithCancel(context.Background())
+				}
+				l.stateMu.Unlock()
 			}
 		}
 	}

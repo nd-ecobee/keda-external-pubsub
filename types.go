@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"cloud.google.com/go/pubsub"
@@ -34,8 +36,14 @@ type TopicListener struct {
 	notifyChannels sync.Map
 
 	// The minimum hold duration among all registered observers
-	minHoldDuration   time.Duration
+	minHoldDuration   atomic.Int64
 	minHoldDurationMu sync.Mutex
+
+	// State for holding a single message
+	stateMu     sync.Mutex
+	isHolding   bool
+	purgeCtx    context.Context
+	purgeCancel context.CancelFunc
 
 	stopCh chan struct{}
 }
