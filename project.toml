@@ -1,0 +1,23 @@
+[_]
+schema-version = "0.2"
+
+[project]
+id = "keda-external-pubsub"
+name = "KEDA External Pub/Sub Scaler"
+version = "0.1.0"
+
+[build]
+builder = "paketobuildpacks/builder-jammy-buildpackless-static"
+buildpacks = ["paketo-buildpacks/go"]
+
+[[build.env]]
+name = "CGO_ENABLED"
+value = "0"
+
+[[build.env]]
+name = "BP_GO_BUILD_FLAGS"
+value = "-buildmode=default"
+
+[[build.env]]
+name = "BP_GO_TARGETS"
+value = "."
