@@ -13,7 +13,7 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-func NewTopicListener(promService *PrometheusService, podPSClient *pubsub.Client, topicID string) (*TopicListener, error) {
+func NewTopicListener(podPSClient *pubsub.Client, topicID string) (*TopicListener, error) {
 	topicParts := splitGCPResource(topicID)
 	if len(topicParts) != 4 {
 		return nil, fmt.Errorf("topic ID must be in the format 'projects/<project>/topics/<topic>', got: %s", topicID)
@@ -22,7 +22,6 @@ func NewTopicListener(promService *PrometheusService, podPSClient *pubsub.Client
 	topicName := topicParts[3]
 
 	l := &TopicListener{
-		promService:  promService,
 		podPSClient:  podPSClient,
 		topicID:      topicID,
 		topicProject: topicProject,
@@ -52,30 +51,18 @@ func NewTopicListener(promService *PrometheusService, podPSClient *pubsub.Client
 	}
 	l.sub = sub
 
-	// Synchronously check state (metrics based)
-	isActive := l.isActiveByMetrics()
-	l.active.Store(isActive)
-	log.Printf("Topic %s initialization metric active status: %v", l.topicID, isActive)
+	// Active is initially false until a message arrives
+	l.active = false
 
 	go l.listen()
 	
 	return l, nil
 }
 
-func (l *TopicListener) isActiveByMetrics() bool {
-	extDuration := time.Duration(l.minHoldDuration.Load())
-	count, err := l.promService.GetTopicPublishRate(l.topicProject, l.topicName, extDuration)
-	if err != nil {
-		log.Printf("Error checking publish rate in isActiveByMetrics for %s: %v", l.topicID, err)
-		return false
-	}
-	active := count > 0
-	l.lastMetricActive.Store(active)
-	return active
-}
-
 func (l *TopicListener) IsActive() bool {
-	return l.active.Load()
+	l.stateMu.RLock()
+	defer l.stateMu.RUnlock()
+	return l.active
 }
 
 func (s *PubSubScaler) getListener(topicID string) (*TopicListener, error) {
@@ -94,7 +81,7 @@ func (s *PubSubScaler) getListener(topicID string) (*TopicListener, error) {
 		return l, nil
 	}
 
-	l, err := NewTopicListener(s.promService, s.podPSClient, topicID)
+	l, err := NewTopicListener(s.podPSClient, topicID)
 	if err != nil {
 		return nil, err
 	}
@@ -103,7 +90,7 @@ func (s *PubSubScaler) getListener(topicID string) (*TopicListener, error) {
 	return l, nil
 }
 
-func (l *TopicListener) register(notifyCh chan struct{}, holdDuration time.Duration, checkInterval time.Duration) {
+func (l *TopicListener) register(notifyCh chan bool, holdDuration time.Duration, checkInterval time.Duration) {
 	l.notifyChannels.Store(notifyCh, struct{}{})
 
 	// Ensure we use the minimum requested duration across all observers,
@@ -119,88 +106,84 @@ func (l *TopicListener) register(notifyCh chan struct{}, holdDuration time.Durat
 	l.checkInterval.Store(int64(min(currentCheck, checkInterval)))
 	l.checkIntervalMu.Unlock()
 
-	// If currently active, immediately notify the new observer
-	if l.IsActive() {
-		select {
-		case notifyCh <- struct{}{}:
-		default:
-		}
-	}
+	// Immediately notify the new observer of the current state
+	notifyCh <- l.IsActive()
+}
+
+func (l *TopicListener) unregister(notifyCh chan bool) {
+	l.notifyChannels.Delete(notifyCh)
 }
 
 func (l *TopicListener) listen() {
-	ctx := context.Background()
-
 	l.sub.ReceiveSettings.MaxOutstandingMessages = 1
 	l.sub.ReceiveSettings.NumGoroutines = 1
 	l.sub.ReceiveSettings.Synchronous = true
-	l.sub.ReceiveSettings.MaxExtension = time.Duration(l.minHoldDuration.Load()) + 1*time.Minute
 
 	log.Printf("Starting listener for topic %s on sub %s", l.topicID, l.sub.ID())
 
-	// Background ticker for periodic deactivation checks
-	go func() {
-		for {
-			interval := time.Duration(l.checkInterval.Load())
-			select {
-			case <-l.stopCh:
-				return
-			case <-time.After(interval):
-				// Optimization: skip metric check if we are currently holding a message
-				if l.hasMsg.Load() {
-					continue
+	for {
+		interval := time.Duration(l.checkInterval.Load())
+		l.sub.ReceiveSettings.MaxExtension = interval + 1*time.Minute
+
+		ctx, cancel := context.WithCancel(context.Background())
+		receiveDone := make(chan struct{})
+
+		var notFound bool
+
+		go func() {
+			defer close(receiveDone)
+			err := l.sub.Receive(ctx, func(c context.Context, msg *pubsub.Message) {
+				l.stateMu.Lock()
+				l.lastMsgTime = time.Now()
+				if !l.active {
+					l.active = true
+					l.broadcast(true)
+					log.Printf("Topic %s ACTIVE", l.topicID)
 				}
+				l.stateMu.Unlock()
 
-				// Poll the metrics for update between purge and next message
-				l.updateActiveState()
+				// Block until context is canceled (on checkInterval)
+				<-c.Done()
+				msg.Nack()
+			})
+
+			if err != nil {
+				st, ok := status.FromError(err)
+				if ok && st.Code() == codes.NotFound {
+					notFound = true
+				} else {
+					log.Printf("Receive error for topic %s: %v", l.topicID, err)
+				}
 			}
-		}
-	}()
+		}()
 
-	err := l.sub.Receive(ctx, func(ctx context.Context, msg *pubsub.Message) {
-		l.active.Store(true)
-		l.hasMsg.Store(true)
-
-		l.notifyChannels.Range(func(key, value interface{}) bool {
-			ch := key.(chan struct{})
-			select {
-			case ch <- struct{}{}:
-			default:
-			}
-			return true
-		})
-
-		hold := time.Duration(l.minHoldDuration.Load())
-		
-		// The message hold: block this callback for the required duration.
-		time.Sleep(hold)
-
-		l.hasMsg.Store(false)
-
-		// 1. ALWAYS purge after hold
-		l.purge()
-
-		// 2. Update active state based on topic metrics (keep active if topic is busy)
-		l.updateActiveState()
-
-		msg.Nack()
-	})
-
-	if err != nil {
-		st, ok := status.FromError(err)
-		if ok && st.Code() == codes.NotFound {
-			log.Printf("Topic or subscription not found for %s: %v. Stopping listener.", l.topicID, err)
+		select {
+		case <-l.stopCh:
+			cancel()
+			<-receiveDone
 			return
-		}
-		log.Fatalf("CRITICAL: Receive error for topic %s: %v. Crashing pod for restart.", l.topicID, err)
-	}
-}
+		case <-time.After(interval):
+			cancel()
+			<-receiveDone
 
-func (l *TopicListener) updateActiveState() {
-	active := l.isActiveByMetrics()
-	old := l.active.Swap(active)
-	if old != active {
-		log.Printf("Topic %s active state changed to: %v", l.topicID, active)
+			if notFound {
+				log.Printf("Topic or subscription not found for %s. Stopping listener.", l.topicID)
+				return
+			}
+
+			l.purge()
+
+			l.stateMu.Lock()
+			if l.active {
+				hold := time.Duration(l.minHoldDuration.Load())
+				if time.Since(l.lastMsgTime) >= hold {
+					l.active = false
+					l.broadcast(false)
+					log.Printf("Topic %s INACTIVE (idle for %s)", l.topicID, hold)
+				}
+			}
+			l.stateMu.Unlock()
+		}
 	}
 }
 
@@ -210,4 +193,15 @@ func (l *TopicListener) purge() {
 	if err := l.sub.SeekToTime(ctx, time.Now()); err != nil {
 		log.Printf("Error purging sub %s: %v", l.sub.ID(), err)
 	}
+}
+
+func (l *TopicListener) broadcast(active bool) {
+	l.notifyChannels.Range(func(key, value interface{}) bool {
+		ch := key.(chan bool)
+		select {
+		case ch <- active:
+		default:
+		}
+		return true
+	})
 }

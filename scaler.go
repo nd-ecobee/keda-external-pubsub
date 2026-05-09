@@ -19,20 +19,18 @@ func NewPubSubScaler() *PubSubScaler {
 	}
 
 	return &PubSubScaler{
-		promService: NewPrometheusService(),
 		podPSClient: podPSClient,
 		listeners:   make(map[string]*TopicListener),
 	}
 }
 
-func (s *PubSubScaler) getManager(meta map[string]string) (*SubscriptionManager, error) {
+func (s *PubSubScaler) getListenerWithMeta(meta map[string]string) (*TopicListener, time.Duration, time.Duration, error) {
 	topicID := meta["topic"]
-	sub := meta["subscription"]
 	holdStr := meta["holdDuration"]
 	checkStr := meta["checkInterval"]
 
-	if topicID == "" || sub == "" {
-		return nil, fmt.Errorf("topic and subscription are required in metadata")
+	if topicID == "" {
+		return nil, 0, 0, fmt.Errorf("topic is required in metadata")
 	}
 
 	hold, err := time.ParseDuration(holdStr)
@@ -45,38 +43,12 @@ func (s *PubSubScaler) getManager(meta map[string]string) (*SubscriptionManager,
 		check = 1 * time.Minute // Default check interval 1m
 	}
 
-	key := fmt.Sprintf("%s|%s", topicID, sub)
-
-	if m, ok := s.managers.Load(key); ok {
-		return m.(*SubscriptionManager), nil
-	}
-
-	// 1. s.getListener
 	listener, err := s.getListener(topicID)
 	if err != nil {
-		return nil, err
+		return nil, 0, 0, err
 	}
 
-	// 2. NewSubscriptionManager
-	subParts := splitGCPResource(sub)
-	if len(subParts) != 4 {
-		return nil, fmt.Errorf("subscription must be in the format 'projects/<project>/subscriptions/<sub>', got: %s", sub)
-	}
-	subProject := subParts[1]
-	subID := subParts[3]
-
-	m := NewSubscriptionManager(s.promService, subProject, subID, hold, check, listener.IsActive)
-
-	// Try to store
-	actual, loaded := s.managers.LoadOrStore(key, m)
-	if loaded {
-		return actual.(*SubscriptionManager), nil
-	}
-
-	// 3. listener.register()
-	listener.register(m.msgNotify, m.holdDuration, m.checkInterval)
-
-	return m, nil
+	return listener, hold, check, nil
 }
 
 func splitGCPResource(res string) []string {
@@ -84,30 +56,25 @@ func splitGCPResource(res string) []string {
 }
 
 func (s *PubSubScaler) IsActive(ctx context.Context, ref *pb.ScaledObjectRef) (*pb.IsActiveResponse, error) {
-	m, err := s.getManager(ref.ScalerMetadata)
+	listener, _, _, err := s.getListenerWithMeta(ref.ScalerMetadata)
 	if err != nil {
 		return nil, err
 	}
-	return &pb.IsActiveResponse{Result: m.IsActive()}, nil
+	return &pb.IsActiveResponse{Result: listener.IsActive()}, nil
 }
 
 func (s *PubSubScaler) StreamIsActive(ref *pb.ScaledObjectRef, stream pb.ExternalScaler_StreamIsActiveServer) error {
-	m, err := s.getManager(ref.ScalerMetadata)
+	listener, hold, check, err := s.getListenerWithMeta(ref.ScalerMetadata)
 	if err != nil {
 		return err
 	}
 
 	ch := make(chan bool, 1)
-	m.streams.Store(ch, struct{}{})
+	listener.register(ch, hold, check)
 
 	defer func() {
-		m.streams.Delete(ch)
+		listener.unregister(ch)
 	}()
-
-	initialActive := m.IsActive()
-	if err := stream.Send(&pb.IsActiveResponse{Result: initialActive}); err != nil {
-		return err
-	}
 
 	for {
 		select {
@@ -125,18 +92,6 @@ func (s *PubSubScaler) GetMetricSpec(ctx context.Context, ref *pb.ScaledObjectRe
 	return &pb.GetMetricSpecResponse{
 		MetricSpecs: []*pb.MetricSpec{
 			{
-				MetricName:      MetricHasTriggerMessage,
-				TargetSizeFloat: 1,
-			},
-			{
-				MetricName:      MetricTopicMetricActive,
-				TargetSizeFloat: 1,
-			},
-			{
-				MetricName:      MetricSubscriptionMetricActive,
-				TargetSizeFloat: 1,
-			},
-			{
 				MetricName:      MetricHasPendingMessage,
 				TargetSizeFloat: 1,
 			},
@@ -145,41 +100,21 @@ func (s *PubSubScaler) GetMetricSpec(ctx context.Context, ref *pb.ScaledObjectRe
 }
 
 func (s *PubSubScaler) GetMetrics(ctx context.Context, req *pb.GetMetricsRequest) (*pb.GetMetricsResponse, error) {
-	m, err := s.getManager(req.ScaledObjectRef.ScalerMetadata)
+	listener, _, _, err := s.getListenerWithMeta(req.ScaledObjectRef.ScalerMetadata)
 	if err != nil {
 		return nil, err
 	}
 
-	topicID := req.ScaledObjectRef.ScalerMetadata["topic"]
-	listener, err := s.getListener(topicID)
-	if err != nil {
-		return nil, err
-	}
-
-	asFloat := func(b bool) float64 {
-		if b {
-			return 1
-		}
-		return 0
+	var hasPending float64 = 0
+	if listener.IsActive() {
+		hasPending = 1
 	}
 
 	return &pb.GetMetricsResponse{
 		MetricValues: []*pb.MetricValue{
 			{
-				MetricName:       MetricHasTriggerMessage,
-				MetricValueFloat: asFloat(listener.hasMsg.Load()),
-			},
-			{
-				MetricName:       MetricTopicMetricActive,
-				MetricValueFloat: asFloat(listener.lastMetricActive.Load()),
-			},
-			{
-				MetricName:       MetricSubscriptionMetricActive,
-				MetricValueFloat: asFloat(m.lastMetricActive.Load()),
-			},
-			{
 				MetricName:       MetricHasPendingMessage,
-				MetricValueFloat: asFloat(m.IsActive()),
+				MetricValueFloat: hasPending,
 			},
 		},
 	}, nil

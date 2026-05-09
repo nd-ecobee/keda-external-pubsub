@@ -3,16 +3,14 @@
 A high-performance, event-driven external scaler for KEDA that provides "Cloud Run-like" instant scaling for GCP Pub/Sub.
 
 ## Why this exists?
-The standard KEDA GCP Pub/Sub scaler relies on Cloud Monitoring metrics, which can have a 2-3 minute lag. This scaler uses a **Streaming Pull** "Starter Motor" architecture:
+The standard KEDA GCP Pub/Sub scaler relies on Cloud Monitoring metrics, which can have a 2-3 minute lag. This scaler uses a pure **Streaming Pull** "Starter Motor" architecture:
 1.  **Instant-On:** Maintains an ephemeral subscription to the topic and signals KEDA to scale up the moment a message is published.
-2.  **Metric-Backed Hold:** Once active, it keeps the pods up for a configurable `holdDuration`.
-3.  **Clean Shutdown:** Uses PromQL (PQL) to verify the worker subscription's backlog is empty before allowing a scale-to-zero.
+2.  **Metric-Free Hold:** Once active, it pulls a single message, Nacks it, and keeps the scaling target alive for a configurable `holdDuration` without querying GCP API metrics, saving cost and reducing latency to zero.
 
 ## Features
 - **Sub-second scaling lag.**
-- **Supports multiple topics/subscriptions** in a single instance.
-- **Strictly one-way data flow:** Decoupled listener and manager logic.
-- **GCP Native PQL support:** Uses the modern Prometheus API for backlog checks.
+- **Supports multiple topics** in a single instance.
+- **Zero API Polling Cost:** Purely event-driven, relying only on Pub/Sub streaming pull.
 - **mTLS support** for secure gRPC communication.
 
 ---
@@ -51,7 +49,7 @@ operator:
 ```
 
 ### 2. Configure ScaledObject
-Because the scaler is running in the same pod as the operator, you can point KEDA to `localhost:9090`.
+Because the scaler is running in the same pod as the operator, you can point KEDA to `localhost:9090`. We combine this "starter motor" with standard Prometheus triggers to handle 0-to-1 instantly, while letting metrics handle 1-to-N scaling.
 
 ```yaml
 apiVersion: keda.sh/v1alpha1
@@ -63,7 +61,32 @@ spec:
     name: your-deployment
   minReplicaCount: 0
   maxReplicaCount: 20
-Receive error for topic     # How often to check PQL metrics
+  triggers:
+    # 1. The Starter Motor: Instantly scales from 0 -> 1 on first message
+    - type: external-push
+      metadata:
+        scalerAddress: localhost:9090
+        topic: "projects/your-project/topics/your-topic"
+        holdDuration: "5m"      # Keep pods alive for 5m after last message
+        checkInterval: "1m"     # How often to check topic queue/backlog
+    
+    # 2. Topic Publish Rate: Keeps scaler active if messages are flowing
+    - type: prometheus
+      metadata:
+        serverAddress: https://monitoring.googleapis.com/v1/projects/your-project/location/global/prometheus
+        metricName: topic_publish_rate
+        query: sum(rate({__name__="pubsub.googleapis.com/topic/send_request_count", monitored_resource="pubsub_topic", topic_id="your-topic"}[1m]))
+        threshold: "1"
+        authModes: "bearer"
+
+    # 3. Subscription Backlog: Scales 1 -> N based on queue depth
+    - type: prometheus
+      metadata:
+        serverAddress: https://monitoring.googleapis.com/v1/projects/your-project/location/global/prometheus
+        metricName: subscription_backlog
+        query: max_over_time({__name__="pubsub.googleapis.com/subscription/num_undelivered_messages", monitored_resource="pubsub_subscription", subscription_id="your-worker-sub"}[1m])
+        threshold: "10" # Target 10 messages per pod
+        authModes: "bearer"
 ```
 
 ---
