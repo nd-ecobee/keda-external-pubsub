@@ -41,6 +41,7 @@ type TopicListener struct {
 	stateMu     sync.RWMutex
 	active      bool
 	lastMsgTime time.Time
+	holdTimer   *time.Timer
 
 	stopCh chan struct{}
 }

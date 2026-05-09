@@ -55,7 +55,7 @@ func NewTopicListener(podPSClient *pubsub.Client, topicID string) (*TopicListene
 	l.active = false
 
 	go l.listen()
-	
+
 	return l, nil
 }
 
@@ -115,75 +115,67 @@ func (l *TopicListener) unregister(notifyCh chan bool) {
 }
 
 func (l *TopicListener) listen() {
+	interval := time.Duration(l.checkInterval.Load())
+
 	l.sub.ReceiveSettings.MaxOutstandingMessages = 1
 	l.sub.ReceiveSettings.NumGoroutines = 1
 	l.sub.ReceiveSettings.Synchronous = true
+	l.sub.ReceiveSettings.MaxExtension = interval + 1*time.Minute
 
 	log.Printf("Starting listener for topic %s on sub %s", l.topicID, l.sub.ID())
 
-	for {
-		interval := time.Duration(l.checkInterval.Load())
-		l.sub.ReceiveSettings.MaxExtension = interval + 1*time.Minute
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-		ctx, cancel := context.WithCancel(context.Background())
-		receiveDone := make(chan struct{})
+	err := l.sub.Receive(ctx, func(c context.Context, msg *pubsub.Message) {
+		hold := time.Duration(l.minHoldDuration.Load())
 
-		var notFound bool
-
-		go func() {
-			defer close(receiveDone)
-			err := l.sub.Receive(ctx, func(c context.Context, msg *pubsub.Message) {
-				l.stateMu.Lock()
-				l.lastMsgTime = time.Now()
-				if !l.active {
-					l.active = true
-					l.broadcast(true)
-					log.Printf("Topic %s ACTIVE", l.topicID)
-				}
-				l.stateMu.Unlock()
-
-				// Block until context is canceled (on checkInterval)
-				<-c.Done()
-				msg.Nack()
-			})
-
-			if err != nil {
-				st, ok := status.FromError(err)
-				if ok && st.Code() == codes.NotFound {
-					notFound = true
-				} else {
-					log.Printf("Receive error for topic %s: %v", l.topicID, err)
-				}
-			}
-		}()
-
-		select {
-		case <-l.stopCh:
-			cancel()
-			<-receiveDone
-			return
-		case <-time.After(interval):
-			cancel()
-			<-receiveDone
-
-			if notFound {
-				log.Printf("Topic or subscription not found for %s. Stopping listener.", l.topicID)
-				return
-			}
-
-			l.purge()
-
-			l.stateMu.Lock()
-			if l.active {
-				hold := time.Duration(l.minHoldDuration.Load())
-				if time.Since(l.lastMsgTime) >= hold {
-					l.active = false
-					l.broadcast(false)
-					log.Printf("Topic %s INACTIVE (idle for %s)", l.topicID, hold)
-				}
-			}
-			l.stateMu.Unlock()
+		l.stateMu.Lock()
+		l.lastMsgTime = time.Now()
+		if !l.active {
+			l.active = true
+			l.broadcast(true)
+			log.Printf("Topic %s ACTIVE", l.topicID)
 		}
+
+		// Cancel previous expiry trigger if it exists
+		if l.holdTimer != nil {
+			l.holdTimer.Stop()
+		}
+
+		// Spawn a new trigger for the expiry
+		l.holdTimer = time.AfterFunc(hold, func() {
+			l.stateMu.Lock()
+			defer l.stateMu.Unlock()
+
+			if l.active && time.Since(l.lastMsgTime) >= hold {
+				l.active = false
+				l.broadcast(false)
+				log.Printf("Topic %s INACTIVE (idle for %s)", l.topicID, hold)
+			}
+		})
+		l.stateMu.Unlock()
+
+		// Hold the message for the check interval to prevent a tight Nack loop
+		currentInterval := time.Duration(l.checkInterval.Load())
+		select {
+		case <-time.After(currentInterval):
+		case <-c.Done():
+		}
+
+		// Purge the backlog right before Nacking. This clears the client buffer
+		// and ensures the next poll is for fresh activity.
+		l.purge()
+		msg.Nack()
+	})
+
+	if err != nil {
+		st, ok := status.FromError(err)
+		if ok && st.Code() == codes.NotFound {
+			log.Printf("Topic or subscription not found for %s. Stopping listener.", l.topicID)
+			return
+		}
+		log.Printf("Receive error for topic %s: %v", l.topicID, err)
 	}
 }
 
