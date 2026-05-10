@@ -22,26 +22,59 @@ type PubSubScaler struct {
 	listenersMu sync.RWMutex
 }
 
+type ListenerConfig struct {
+	Client       *pubsub.Client
+	TopicID      string // full resource name
+	TopicProject string
+	TopicName    string // short name
+	Topic        *pubsub.Topic
+	SubID        string
+
+	MinHoldDuration   *atomic.Int64
+	MinHoldDurationMu *sync.Mutex
+
+	CheckInterval   *atomic.Int64
+	CheckIntervalMu *sync.Mutex
+}
+
+func (c *ListenerConfig) UpdateHoldDuration(holdDuration time.Duration) {
+	c.MinHoldDurationMu.Lock()
+	defer c.MinHoldDurationMu.Unlock()
+	currentMin := time.Duration(c.MinHoldDuration.Load())
+	effectiveHold := max(30*time.Second, holdDuration)
+	c.MinHoldDuration.Store(int64(min(currentMin, effectiveHold)))
+}
+
+func (c *ListenerConfig) UpdateCheckInterval(checkInterval time.Duration) {
+	c.CheckIntervalMu.Lock()
+	defer c.CheckIntervalMu.Unlock()
+	currentCheck := time.Duration(c.CheckInterval.Load())
+	c.CheckInterval.Store(int64(min(currentCheck, checkInterval)))
+}
+
 type TopicListener struct {
-	podPSClient  *pubsub.Client
-	topicID      string // full resource name
-	topicProject string
-	topicName    string // short name
-	sub          *pubsub.Subscription
+	config ListenerConfig
 	
 	// Channels to notify when active state changes. Key: chan bool, Value: struct{}
 	notifyChannels sync.Map
 
-	minHoldDuration   atomic.Int64
-	minHoldDurationMu sync.Mutex
+	activeOp atomic.Pointer[receiveOperation]
 
-	checkInterval   atomic.Int64
-	checkIntervalMu sync.Mutex
+	stopCh chan struct{}
+}
+
+type receiveOperation struct {
+	config          ListenerConfig
+	sub             *pubsub.Subscription
+	minHoldDuration *atomic.Int64
+	checkInterval   *atomic.Int64
+	broadcast       func(bool)
 
 	stateMu     sync.RWMutex
 	active      bool
 	lastMsgTime time.Time
-	holdTimer   *time.Timer
 
-	stopCh chan struct{}
+	mu        sync.Mutex
+	holdTimer *time.Timer
 }
+
