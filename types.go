@@ -25,7 +25,6 @@ type PubSubScaler struct {
 
 type ListenerConfig struct {
 	Client          *pubsub.Client
-	TopicID         string // full resource name
 	Topic           *pubsub.Topic
 	SubID           string
 	MinHoldDuration *atomic.Int64

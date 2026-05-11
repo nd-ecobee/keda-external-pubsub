@@ -26,7 +26,7 @@ func NewTopicListener(podPSClient *pubsub.Client, topicID string) (*TopicListene
 
 	h := fnv.New32a()
 	podName, _ := os.Hostname()
-	h.Write([]byte(topicID + podName))
+	h.Write([]byte(podName))
 	subID := fmt.Sprintf("keda-%s-%x", topicName, h.Sum32())
 
 	topic := podPSClient.TopicInProject(topicName, topicProject)
@@ -38,7 +38,6 @@ func NewTopicListener(podPSClient *pubsub.Client, topicID string) (*TopicListene
 
 	config := ListenerConfig{
 		Client:          podPSClient,
-		TopicID:         topicID,
 		Topic:           topic,
 		SubID:           subID,
 		MinHoldDuration: minHold,
@@ -85,6 +84,7 @@ func (l *TopicListener) controlLoop(config ListenerConfig) {
 
 	for {
 		if l.runCtx.Err() != nil {
+			log.Printf("TopicListener control loop exiting for topic %s: %v", config.Topic.String(), l.runCtx.Err())
 			return
 		}
 
@@ -95,6 +95,7 @@ func (l *TopicListener) controlLoop(config ListenerConfig) {
 
 		_, err := backoff.Retry(l.runCtx, operation, backoff.WithBackOff(backoff.NewExponentialBackOff()))
 		if err != nil {
+			log.Printf("TopicListener control loop exiting for topic %s due to backoff error: %v", config.Topic.String(), err)
 			return // runCtx canceled
 		}
 
@@ -237,11 +238,9 @@ func (op *receiveOperation) processMessage(c context.Context, msg *pubsub.Messag
 
 	op.holdTimer = time.AfterFunc(hold, func() {
 		if op.lease.Load() == currentLease {
-			ctx, cancel := context.WithTimeout(op.runCtx, 1*time.Second)
-			defer cancel()
 			select {
 			case op.stateCh <- false:
-			case <-ctx.Done():
+			case <-c.Done():
 			}
 		}
 	})
