@@ -38,16 +38,10 @@ func (c *ListenerConfig) UpdateConfig(holdDuration, checkInterval time.Duration)
 	defer c.ConfigMu.Unlock()
 
 	currentMin := time.Duration(c.MinHoldDuration.Load())
-	if currentMin == 0 {
-		currentMin = 5 * time.Minute
-	}
 	effectiveHold := max(30*time.Second, holdDuration)
 	c.MinHoldDuration.Store(int64(min(currentMin, effectiveHold)))
 
 	currentCheck := time.Duration(c.CheckInterval.Load())
-	if currentCheck == 0 {
-		currentCheck = 1 * time.Minute
-	}
 	newCheck := int64(min(currentCheck, checkInterval))
 	oldCheck := c.CheckInterval.Swap(newCheck)
 
@@ -70,7 +64,6 @@ type receiveOperation struct {
 	checkInterval   time.Duration
 	stateCh         chan<- bool
 
-	stateMu   sync.Mutex
 	lease     atomic.Uint64
 	holdTimer *time.Timer
 
