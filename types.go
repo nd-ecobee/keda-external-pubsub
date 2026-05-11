@@ -37,44 +37,49 @@ type ListenerConfig struct {
 	CheckIntervalMu *sync.Mutex
 }
 
-func (c *ListenerConfig) UpdateHoldDuration(holdDuration time.Duration) {
+func (c *ListenerConfig) UpdateConfig(holdDuration, checkInterval time.Duration) bool {
 	c.MinHoldDurationMu.Lock()
-	defer c.MinHoldDurationMu.Unlock()
 	currentMin := time.Duration(c.MinHoldDuration.Load())
+	if currentMin == 0 {
+		currentMin = 5 * time.Minute
+	}
 	effectiveHold := max(30*time.Second, holdDuration)
 	c.MinHoldDuration.Store(int64(min(currentMin, effectiveHold)))
-}
+	c.MinHoldDurationMu.Unlock()
 
-func (c *ListenerConfig) UpdateCheckInterval(checkInterval time.Duration) {
 	c.CheckIntervalMu.Lock()
-	defer c.CheckIntervalMu.Unlock()
 	currentCheck := time.Duration(c.CheckInterval.Load())
-	c.CheckInterval.Store(int64(min(currentCheck, checkInterval)))
+	if currentCheck == 0 {
+		currentCheck = 1 * time.Minute
+	}
+	newCheck := int64(min(currentCheck, checkInterval))
+	oldCheck := c.CheckInterval.Swap(newCheck)
+	c.CheckIntervalMu.Unlock()
+
+	return oldCheck != 0 && oldCheck != newCheck
 }
 
 type TopicListener struct {
-	config ListenerConfig
+	updateConfig func(time.Duration, time.Duration) bool
 	
 	// Channels to notify when active state changes. Key: chan bool, Value: struct{}
 	notifyChannels sync.Map
 
 	activeOp atomic.Pointer[receiveOperation]
 
-	stopCh chan struct{}
+	stateCh    chan bool
+	recreateCh chan struct{}
+	stopCh     chan struct{}
 }
 
 type receiveOperation struct {
-	config          ListenerConfig
-	sub             *pubsub.Subscription
-	minHoldDuration *atomic.Int64
-	checkInterval   *atomic.Int64
-	broadcast       func(bool)
+	config  ListenerConfig
+	sub     *pubsub.Subscription
+	stateCh chan<- bool
 
-	stateMu     sync.RWMutex
-	active      bool
-	lastMsgTime time.Time
-
-	mu        sync.Mutex
+	stateMu   sync.RWMutex
+	active    bool
+	lease     uint64
 	holdTimer *time.Timer
 }
 
