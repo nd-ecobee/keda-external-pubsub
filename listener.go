@@ -64,9 +64,12 @@ func (l *TopicListener) ensureSubscription(config ListenerConfig) error {
 		ExpirationPolicy: 24 * time.Hour,
 	})
 	if st, _ := status.FromError(err); st.Code() == codes.AlreadyExists {
+		log.Printf("Verified subscription %s exists", config.SubID)
 		return nil
 	} else if err != nil {
 		log.Printf("Warning: failed to create subscription %s, retrying: %v", config.SubID, err)
+	} else {
+		log.Printf("Successfully created subscription %s", config.SubID)
 	}
 	return err
 }
@@ -148,6 +151,7 @@ func (l *TopicListener) controlLoop(config ListenerConfig) {
 				}
 
 			case ev := <-internalStateCh:
+				log.Printf("Topic %s: %v (lease %d)", config.Topic.String(), ev.active, ev.lease)
 				if ev.lease >= l.lease.Load() && ev.active != l.isActive.Load() {
 					l.isActive.Store(ev.active)
 					l.broadcast(ev.active)
@@ -212,7 +216,11 @@ func (l *TopicListener) Unregister(notifyCh chan bool) {
 }
 
 func (op *receiveOperation) Run() (struct{}, error) {
-	defer op.holdTimer.Stop()
+	log.Printf("Starting stream pull for subscription %s", op.sub.ID())
+	defer func() {
+		op.holdTimer.Stop()
+		log.Printf("Stream pull for subscription %s stopped", op.sub.ID())
+	}()
 
 	op.sub.ReceiveSettings.MaxOutstandingMessages = 1
 	op.sub.ReceiveSettings.NumGoroutines = 1
@@ -231,6 +239,7 @@ func (op *receiveOperation) Run() (struct{}, error) {
 }
 
 func (op *receiveOperation) processMessage(c context.Context, msg *pubsub.Message) {
+	log.Printf("Received message %s on subscription %s", msg.ID, op.sub.ID())
 	hold := time.Duration(op.minHoldDuration.Load())
 
 	currentLease := op.lease.Add(1)
@@ -259,9 +268,11 @@ func (op *receiveOperation) processMessage(c context.Context, msg *pubsub.Messag
 	// and ensures the next poll is for fresh activity.
 	op.purge()
 	msg.Nack()
+	log.Printf("Nacked message %s on subscription %s", msg.ID, op.sub.ID())
 }
 
 func (op *receiveOperation) purge() {
+	log.Printf("Purging backlog for subscription %s", op.sub.ID())
 	// The shared runCtx handles scaler teardown, plus a timeout so SeekToTime doesn't block indefinitely
 	ctx, cancel := context.WithTimeout(op.runCtx, 5*time.Second)
 	defer cancel()
