@@ -37,35 +37,32 @@ func NewTopicListener(podPSClient *pubsub.Client, topicID string) (*TopicListene
 	checkInt.Store(int64(1 * time.Minute))
 
 	config := ListenerConfig{
-		Client:            podPSClient,
-		TopicID:           topicID,
-		TopicProject:      topicProject,
-		TopicName:         topicName,
-		Topic:             topic,
-		SubID:             subID,
-		MinHoldDuration:   minHold,
-		MinHoldDurationMu: &sync.Mutex{},
-		CheckInterval:     checkInt,
-		CheckIntervalMu:   &sync.Mutex{},
+		Client:          podPSClient,
+		TopicID:         topicID,
+		Topic:           topic,
+		SubID:           subID,
+		MinHoldDuration: minHold,
+		CheckInterval:   checkInt,
+		ConfigMu:        &sync.Mutex{},
 	}
+
+	ctx, cancel := context.WithCancel(context.Background())
 
 	l := &TopicListener{
-		config:          config,
-		reconcileCh:     make(chan struct{}, 1),
-		internalStateCh: make(chan bool),
+		updateConfig: config.UpdateConfig,
+		reconcileCh:  make(chan bool, 1),
+		runCtx:       ctx,
+		runCancel:    cancel,
 	}
 
-	go func() {
-		ctx := context.Background()
-		l.controlLoop(ctx)
-	}()
+	go l.controlLoop(config)
 
 	return l, nil
 }
 
-func (l *TopicListener) ensureSubscription(ctx context.Context) error {
-	_, err := l.config.Client.CreateSubscription(ctx, l.config.SubID, pubsub.SubscriptionConfig{
-		Topic:            l.config.Topic,
+func (l *TopicListener) ensureSubscription(config ListenerConfig) error {
+	_, err := config.Client.CreateSubscription(l.runCtx, config.SubID, pubsub.SubscriptionConfig{
+		Topic:            config.Topic,
 		ExpirationPolicy: 24 * time.Hour,
 	})
 	if err != nil {
@@ -73,7 +70,7 @@ func (l *TopicListener) ensureSubscription(ctx context.Context) error {
 		if ok && st.Code() == codes.AlreadyExists {
 			return nil
 		}
-		log.Printf("Warning: failed to create subscription %s, retrying: %v", l.config.SubID, err)
+		log.Printf("Warning: failed to create subscription %s, retrying: %v", config.SubID, err)
 		return err
 	}
 	return nil
@@ -90,20 +87,22 @@ func (l *TopicListener) broadcast(active bool) {
 	})
 }
 
-func (l *TopicListener) controlLoop(ctx context.Context) {
+func (l *TopicListener) controlLoop(config ListenerConfig) {
+	internalStateCh := make(chan bool)
+
 	for {
-		if ctx.Err() != nil {
+		if l.runCtx.Err() != nil {
 			return
 		}
 
 		// 1. Single retry call to ensureSubscription
 		operation := func() (struct{}, error) {
-			return struct{}{}, l.ensureSubscription(ctx)
+			return struct{}{}, l.ensureSubscription(config)
 		}
 
-		_, err := backoff.Retry(ctx, operation, backoff.WithBackOff(backoff.NewExponentialBackOff()))
+		_, err := backoff.Retry(l.runCtx, operation, backoff.WithBackOff(backoff.NewExponentialBackOff()))
 		if err != nil {
-			return // ctx canceled
+			return // runCtx canceled
 		}
 
 		var opCtx context.Context
@@ -121,20 +120,21 @@ func (l *TopicListener) controlLoop(ctx context.Context) {
 
 		startOperation := func() {
 			stopOperation()
-			opCtx, opCancel = context.WithCancel(ctx)
+			opCtx, opCancel = context.WithCancel(l.runCtx)
 			opDoneCh = make(chan struct{})
 
-			sub := l.config.Client.Subscription(l.config.SubID)
+			sub := config.Client.Subscription(config.SubID)
 
 			timer := time.NewTimer(0)
 			timer.Stop()
 
 			op := &receiveOperation{
 				sub:             sub,
-				minHoldDuration: l.config.MinHoldDuration,
-				checkInterval:   time.Duration(l.config.CheckInterval.Load()),
-				stateCh:         l.internalStateCh,
+				minHoldDuration: config.MinHoldDuration,
+				checkInterval:   time.Duration(config.CheckInterval.Load()),
+				stateCh:         internalStateCh,
 				holdTimer:       timer,
+				runCtx:          opCtx,
 			}
 
 			l.activeOp.Store(op)
@@ -142,7 +142,7 @@ func (l *TopicListener) controlLoop(ctx context.Context) {
 			go func() {
 				defer close(opDoneCh)
 				runOperation := func() (struct{}, error) {
-					return op.run(opCtx)
+					return op.run()
 				}
 				_, _ = backoff.Retry(opCtx, runOperation, backoff.WithBackOff(backoff.NewExponentialBackOff()))
 				
@@ -152,22 +152,21 @@ func (l *TopicListener) controlLoop(ctx context.Context) {
 
 		// Trigger initial reconcile
 		select {
-		case l.reconcileCh <- struct{}{}:
+		case l.reconcileCh <- false:
 		default:
 		}
 
 	InnerLoop:
 		for {
 			select {
-			case <-ctx.Done():
+			case <-l.runCtx.Done():
 				stopOperation()
 				return
-			case <-l.reconcileCh:
-				forceRecreate := l.needsRecreate.Swap(false)
+			case needsRecreate := <-l.reconcileCh:
 				count := l.streamCount.Load()
 
 				if count > 0 {
-					if opCtx == nil || forceRecreate {
+					if opCtx == nil || opCtx.Err() != nil || needsRecreate {
 						startOperation()
 					}
 				} else {
@@ -177,7 +176,7 @@ func (l *TopicListener) controlLoop(ctx context.Context) {
 				// Broadcast current state to ensure any newly registered channels get the initial state
 				l.broadcast(l.isActive.Load())
 
-			case active := <-l.internalStateCh:
+			case active := <-internalStateCh:
 				if l.isActive.Load() != active {
 					l.isActive.Store(active)
 					l.broadcast(active)
@@ -224,28 +223,20 @@ func (s *PubSubScaler) getListener(topicID string) (*TopicListener, error) {
 func (l *TopicListener) register(notifyCh chan bool, holdDuration time.Duration, checkInterval time.Duration) {
 	l.notifyChannels.Store(notifyCh, struct{}{})
 
-	if l.config.UpdateConfig(holdDuration, checkInterval) {
-		l.needsRecreate.Store(true)
-	}
+	needsRecreate := l.updateConfig(holdDuration, checkInterval)
 	l.streamCount.Add(1)
 
-	select {
-	case l.reconcileCh <- struct{}{}:
-	default:
-	}
+	l.reconcileCh <- needsRecreate
 }
 
 func (l *TopicListener) unregister(notifyCh chan bool) {
 	l.notifyChannels.Delete(notifyCh)
 	l.streamCount.Add(-1)
 
-	select {
-	case l.reconcileCh <- struct{}{}:
-	default:
-	}
+	l.reconcileCh <- false
 }
 
-func (op *receiveOperation) run(ctx context.Context) (struct{}, error) {
+func (op *receiveOperation) run() (struct{}, error) {
 	defer op.holdTimer.Stop()
 
 	op.sub.ReceiveSettings.MaxOutstandingMessages = 1
@@ -253,7 +244,7 @@ func (op *receiveOperation) run(ctx context.Context) (struct{}, error) {
 	op.sub.ReceiveSettings.Synchronous = true
 	op.sub.ReceiveSettings.MaxExtension = op.checkInterval + 1*time.Minute
 
-	err := op.sub.Receive(ctx, op.processMessage)
+	err := op.sub.Receive(op.runCtx, op.processMessage)
 
 	if st, _ := status.FromError(err); st.Code() == codes.NotFound {
 		log.Printf("Subscription not found for %s, will recreate: %v", op.sub.ID(), err)
@@ -267,18 +258,12 @@ func (op *receiveOperation) run(ctx context.Context) (struct{}, error) {
 func (op *receiveOperation) processMessage(c context.Context, msg *pubsub.Message) {
 	hold := time.Duration(op.minHoldDuration.Load())
 
-	op.stateMu.Lock()
-	op.lease++
-	currentLease := op.lease
-	op.stateMu.Unlock()
+	currentLease := op.lease.Add(1)
 
 	op.holdTimer.Stop()
 
 	op.holdTimer = time.AfterFunc(hold, func() {
-		op.stateMu.Lock()
-		defer op.stateMu.Unlock()
-
-		if op.lease == currentLease {
+		if op.lease.Load() == currentLease {
 			select {
 			case op.stateCh <- false:
 			default:
@@ -304,7 +289,8 @@ func (op *receiveOperation) processMessage(c context.Context, msg *pubsub.Messag
 }
 
 func (op *receiveOperation) purge() {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// The shared runCtx handles scaler teardown, plus a timeout so SeekToTime doesn't block indefinitely
+	ctx, cancel := context.WithTimeout(op.runCtx, 5*time.Second)
 	defer cancel()
 	if err := op.sub.SeekToTime(ctx, time.Now()); err != nil {
 		log.Printf("Error purging sub %s: %v", op.sub.ID(), err)

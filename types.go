@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,7 +16,7 @@ const (
 
 type PubSubScaler struct {
 	externalscaler.UnimplementedExternalScalerServer
-	
+
 	podPSClient *pubsub.Client
 
 	listeners   map[string]*TopicListener
@@ -23,55 +24,46 @@ type PubSubScaler struct {
 }
 
 type ListenerConfig struct {
-	Client       *pubsub.Client
-	TopicID      string // full resource name
-	TopicProject string
-	TopicName    string // short name
-	Topic        *pubsub.Topic
-	SubID        string
-
-	MinHoldDuration   *atomic.Int64
-	MinHoldDurationMu *sync.Mutex
-
+	Client          *pubsub.Client
+	TopicID         string // full resource name
+	Topic           *pubsub.Topic
+	SubID           string
+	MinHoldDuration *atomic.Int64
 	CheckInterval   *atomic.Int64
-	CheckIntervalMu *sync.Mutex
+	ConfigMu        *sync.Mutex
 }
 
 func (c *ListenerConfig) UpdateConfig(holdDuration, checkInterval time.Duration) bool {
-	c.MinHoldDurationMu.Lock()
+	c.ConfigMu.Lock()
+	defer c.ConfigMu.Unlock()
+
 	currentMin := time.Duration(c.MinHoldDuration.Load())
 	if currentMin == 0 {
 		currentMin = 5 * time.Minute
 	}
 	effectiveHold := max(30*time.Second, holdDuration)
 	c.MinHoldDuration.Store(int64(min(currentMin, effectiveHold)))
-	c.MinHoldDurationMu.Unlock()
 
-	c.CheckIntervalMu.Lock()
 	currentCheck := time.Duration(c.CheckInterval.Load())
 	if currentCheck == 0 {
 		currentCheck = 1 * time.Minute
 	}
 	newCheck := int64(min(currentCheck, checkInterval))
 	oldCheck := c.CheckInterval.Swap(newCheck)
-	c.CheckIntervalMu.Unlock()
 
 	return oldCheck != 0 && oldCheck != newCheck
 }
 
 type TopicListener struct {
-	config ListenerConfig
-
+	updateConfig   func(time.Duration, time.Duration) bool
 	notifyChannels sync.Map
+	streamCount    atomic.Int32
+	activeOp       atomic.Pointer[receiveOperation]
+	reconcileCh    chan bool
+	isActive       atomic.Bool
 
-	streamCount   atomic.Int32
-	needsRecreate atomic.Bool
-	activeOp      atomic.Pointer[receiveOperation]
-
-	reconcileCh     chan struct{}
-	internalStateCh chan bool
-
-	isActive atomic.Bool
+	runCtx    context.Context
+	runCancel context.CancelFunc
 }
 
 type receiveOperation struct {
@@ -81,7 +73,8 @@ type receiveOperation struct {
 	stateCh         chan<- bool
 
 	stateMu   sync.Mutex
-	lease     uint64
+	lease     atomic.Uint64
 	holdTimer *time.Timer
-}
 
+	runCtx context.Context
+}
