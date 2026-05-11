@@ -46,13 +46,12 @@ func NewTopicListener(podPSClient *pubsub.Client, topicID string) (*TopicListene
 		ConfigMu:        &sync.Mutex{},
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx := context.Background()
 
 	l := &TopicListener{
 		updateConfig: config.UpdateConfig,
 		reconcileCh:  make(chan bool, 1),
 		runCtx:       ctx,
-		runCancel:    cancel,
 	}
 
 	go l.controlLoop(config)
@@ -79,10 +78,7 @@ func (l *TopicListener) ensureSubscription(config ListenerConfig) error {
 func (l *TopicListener) broadcast(active bool) {
 	l.notifyChannels.Range(func(key, value interface{}) bool {
 		ch := key.(chan bool)
-		select {
-		case ch <- active:
-		default:
-		}
+		TrySend(ch, active)
 		return true
 	})
 }
@@ -105,19 +101,15 @@ func (l *TopicListener) controlLoop(config ListenerConfig) {
 			return // runCtx canceled
 		}
 
-		var opCtx context.Context
-		var opCancel context.CancelFunc = func() {}
-		var opDoneCh chan struct{}
+		opCtx, opCancel := context.WithCancel(context.Background())
+		opCancel() // start canceled
+		opDoneCh := make(chan struct{})
+		close(opDoneCh)
 
 		stopOperation := func() {
 			opCancel()
-			if opDoneCh != nil {
-				<-opDoneCh
-				opDoneCh = nil
-			}
-			opCtx = nil
+			<-opDoneCh
 		}
-
 		startOperation := func() {
 			stopOperation()
 			opCtx, opCancel = context.WithCancel(l.runCtx)
@@ -137,24 +129,17 @@ func (l *TopicListener) controlLoop(config ListenerConfig) {
 				runCtx:          opCtx,
 			}
 
-			l.activeOp.Store(op)
-
 			go func() {
 				defer close(opDoneCh)
 				runOperation := func() (struct{}, error) {
 					return op.run()
 				}
 				_, _ = backoff.Retry(opCtx, runOperation, backoff.WithBackOff(backoff.NewExponentialBackOff()))
-				
-				l.activeOp.CompareAndSwap(op, nil)
 			}()
 		}
 
 		// Trigger initial reconcile
-		select {
-		case l.reconcileCh <- false:
-		default:
-		}
+		TrySend(l.reconcileCh, false)
 
 	InnerLoop:
 		for {
@@ -165,11 +150,9 @@ func (l *TopicListener) controlLoop(config ListenerConfig) {
 			case needsRecreate := <-l.reconcileCh:
 				count := l.streamCount.Load()
 
-				if count > 0 {
-					if opCtx == nil || opCtx.Err() != nil || needsRecreate {
-						startOperation()
-					}
-				} else {
+				if count > 0 && (opCtx.Err() != nil || needsRecreate) {
+					startOperation()
+				} else if count == 0 {
 					stopOperation()
 				}
 
@@ -226,14 +209,18 @@ func (l *TopicListener) register(notifyCh chan bool, holdDuration time.Duration,
 	needsRecreate := l.updateConfig(holdDuration, checkInterval)
 	l.streamCount.Add(1)
 
-	l.reconcileCh <- needsRecreate
+	if needsRecreate {
+		l.reconcileCh <- true
+	} else {
+		TrySend(l.reconcileCh, false)
+	}
 }
 
 func (l *TopicListener) unregister(notifyCh chan bool) {
 	l.notifyChannels.Delete(notifyCh)
 	l.streamCount.Add(-1)
 
-	l.reconcileCh <- false
+	TrySend(l.reconcileCh, false)
 }
 
 func (op *receiveOperation) run() (struct{}, error) {
@@ -264,10 +251,7 @@ func (op *receiveOperation) processMessage(c context.Context, msg *pubsub.Messag
 
 	op.holdTimer = time.AfterFunc(hold, func() {
 		if op.lease.Load() == currentLease {
-			select {
-			case op.stateCh <- false:
-			default:
-			}
+			TrySend(op.stateCh, false)
 		}
 	})
 

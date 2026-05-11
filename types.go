@@ -58,12 +58,10 @@ type TopicListener struct {
 	updateConfig   func(time.Duration, time.Duration) bool
 	notifyChannels sync.Map
 	streamCount    atomic.Int32
-	activeOp       atomic.Pointer[receiveOperation]
 	reconcileCh    chan bool
 	isActive       atomic.Bool
 
-	runCtx    context.Context
-	runCancel context.CancelFunc
+	runCtx context.Context
 }
 
 type receiveOperation struct {
@@ -77,4 +75,13 @@ type receiveOperation struct {
 	holdTimer *time.Timer
 
 	runCtx context.Context
+}
+
+func TrySend[T any](ch chan<- T, value T) bool {
+	select {
+	case ch <- value:
+		return true
+	default:
+		return false
+	}
 }
