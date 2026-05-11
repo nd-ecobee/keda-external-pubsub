@@ -64,15 +64,12 @@ func (l *TopicListener) ensureSubscription(config ListenerConfig) error {
 		Topic:            config.Topic,
 		ExpirationPolicy: 24 * time.Hour,
 	})
-	if err != nil {
-		st, ok := status.FromError(err)
-		if ok && st.Code() == codes.AlreadyExists {
-			return nil
-		}
+	if st, _ := status.FromError(err); st.Code() == codes.AlreadyExists {
+		return nil
+	} else if err != nil {
 		log.Printf("Warning: failed to create subscription %s, retrying: %v", config.SubID, err)
-		return err
 	}
-	return nil
+	return err
 }
 
 func (l *TopicListener) broadcast(active bool) {
