@@ -56,14 +56,18 @@ func splitGCPResource(res string) []string {
 }
 
 func (s *PubSubScaler) IsActive(ctx context.Context, ref *pb.ScaledObjectRef) (*pb.IsActiveResponse, error) {
+	log.Printf("RPC IsActive for %s", ref.Name)
 	listener, _, _, err := s.getListenerWithMeta(ref.ScalerMetadata)
 	if err != nil {
 		return nil, err
 	}
-	return &pb.IsActiveResponse{Result: listener.IsActive()}, nil
+	active := listener.IsActive()
+	log.Printf("IsActive result for %s: %v", ref.Name, active)
+	return &pb.IsActiveResponse{Result: active}, nil
 }
 
 func (s *PubSubScaler) StreamIsActive(ref *pb.ScaledObjectRef, stream pb.ExternalScaler_StreamIsActiveServer) error {
+	log.Printf("RPC StreamIsActive started for %s", ref.Name)
 	listener, hold, check, err := s.getListenerWithMeta(ref.ScalerMetadata)
 	if err != nil {
 		return err
@@ -74,6 +78,7 @@ func (s *PubSubScaler) StreamIsActive(ref *pb.ScaledObjectRef, stream pb.Externa
 
 	defer func() {
 		listener.Unregister(ch)
+		log.Printf("RPC StreamIsActive ended for %s", ref.Name)
 	}()
 
 	for {
@@ -81,6 +86,7 @@ func (s *PubSubScaler) StreamIsActive(ref *pb.ScaledObjectRef, stream pb.Externa
 		case <-stream.Context().Done():
 			return nil
 		case active := <-ch:
+			log.Printf("Streaming active state for %s: %v", ref.Name, active)
 			if err := stream.Send(&pb.IsActiveResponse{Result: active}); err != nil {
 				return err
 			}
@@ -89,6 +95,7 @@ func (s *PubSubScaler) StreamIsActive(ref *pb.ScaledObjectRef, stream pb.Externa
 }
 
 func (s *PubSubScaler) GetMetricSpec(ctx context.Context, ref *pb.ScaledObjectRef) (*pb.GetMetricSpecResponse, error) {
+	log.Printf("RPC GetMetricSpec for %s", ref.Name)
 	return &pb.GetMetricSpecResponse{
 		MetricSpecs: []*pb.MetricSpec{
 			{
@@ -100,6 +107,7 @@ func (s *PubSubScaler) GetMetricSpec(ctx context.Context, ref *pb.ScaledObjectRe
 }
 
 func (s *PubSubScaler) GetMetrics(ctx context.Context, req *pb.GetMetricsRequest) (*pb.GetMetricsResponse, error) {
+	log.Printf("RPC GetMetrics for %s", req.ScaledObjectRef.Name)
 	listener, _, _, err := s.getListenerWithMeta(req.ScaledObjectRef.ScalerMetadata)
 	if err != nil {
 		return nil, err
@@ -110,6 +118,7 @@ func (s *PubSubScaler) GetMetrics(ctx context.Context, req *pb.GetMetricsRequest
 		hasPending = 1
 	}
 
+	log.Printf("GetMetrics values for %s: %f", req.ScaledObjectRef.Name, hasPending)
 	return &pb.GetMetricsResponse{
 		MetricValues: []*pb.MetricValue{
 			{
