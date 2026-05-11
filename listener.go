@@ -50,95 +50,150 @@ func NewTopicListener(podPSClient *pubsub.Client, topicID string) (*TopicListene
 	}
 
 	l := &TopicListener{
-		config:   config,
-		stateCh:  make(chan bool, 1),
-		stopCh:   make(chan struct{}),
-		opCtx:    context.Background(),
-		opCancel: func() {},
+		config:          config,
+		reconcileCh:     make(chan struct{}, 1),
+		internalStateCh: make(chan bool),
 	}
 
-	go l.broadcastLoop()
-	go l.ensureSubscription()
+	go func() {
+		ctx := context.Background()
+		l.controlLoop(ctx)
+	}()
 
 	return l, nil
 }
 
-func (l *TopicListener) ensureSubscription() {
-	if l.subReady.Load() {
-		return
+func (l *TopicListener) ensureSubscription(ctx context.Context) error {
+	_, err := l.config.Client.CreateSubscription(ctx, l.config.SubID, pubsub.SubscriptionConfig{
+		Topic:            l.config.Topic,
+		ExpirationPolicy: 24 * time.Hour,
+	})
+	if err != nil {
+		st, ok := status.FromError(err)
+		if ok && st.Code() == codes.AlreadyExists {
+			return nil
+		}
+		log.Printf("Warning: failed to create subscription %s, retrying: %v", l.config.SubID, err)
+		return err
 	}
+	return nil
+}
 
-	operation := func() (struct{}, error) {
-		_, err := l.config.Client.CreateSubscription(context.Background(), l.config.SubID, pubsub.SubscriptionConfig{
-			Topic:            l.config.Topic,
-			ExpirationPolicy: 24 * time.Hour,
-		})
+func (l *TopicListener) broadcast(active bool) {
+	l.notifyChannels.Range(func(key, value interface{}) bool {
+		ch := key.(chan bool)
+		select {
+		case ch <- active:
+		default:
+		}
+		return true
+	})
+}
+
+func (l *TopicListener) controlLoop(ctx context.Context) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		// 1. Single retry call to ensureSubscription
+		operation := func() (struct{}, error) {
+			return struct{}{}, l.ensureSubscription(ctx)
+		}
+
+		_, err := backoff.Retry(ctx, operation, backoff.WithBackOff(backoff.NewExponentialBackOff()))
 		if err != nil {
-			st, ok := status.FromError(err)
-			if ok && st.Code() == codes.AlreadyExists {
-				// exists
-			} else {
-				log.Printf("Warning: failed to create subscription %s, retrying: %v", l.config.SubID, err)
-				return struct{}{}, err
+			return // ctx canceled
+		}
+
+		var opCtx context.Context
+		var opCancel context.CancelFunc = func() {}
+		var opDoneCh chan struct{}
+
+		stopOperation := func() {
+			opCancel()
+			if opDoneCh != nil {
+				<-opDoneCh
+				opDoneCh = nil
+			}
+			opCtx = nil
+		}
+
+		startOperation := func() {
+			stopOperation()
+			opCtx, opCancel = context.WithCancel(ctx)
+			opDoneCh = make(chan struct{})
+
+			sub := l.config.Client.Subscription(l.config.SubID)
+
+			timer := time.NewTimer(0)
+			timer.Stop()
+
+			op := &receiveOperation{
+				sub:             sub,
+				minHoldDuration: l.config.MinHoldDuration,
+				checkInterval:   time.Duration(l.config.CheckInterval.Load()),
+				stateCh:         l.internalStateCh,
+				holdTimer:       timer,
+			}
+
+			l.activeOp.Store(op)
+
+			go func() {
+				defer close(opDoneCh)
+				runOperation := func() (struct{}, error) {
+					return op.run(opCtx)
+				}
+				_, _ = backoff.Retry(opCtx, runOperation, backoff.WithBackOff(backoff.NewExponentialBackOff()))
+				
+				l.activeOp.CompareAndSwap(op, nil)
+			}()
+		}
+
+		// Trigger initial reconcile
+		select {
+		case l.reconcileCh <- struct{}{}:
+		default:
+		}
+
+	InnerLoop:
+		for {
+			select {
+			case <-ctx.Done():
+				stopOperation()
+				return
+			case <-l.reconcileCh:
+				forceRecreate := l.needsRecreate.Swap(false)
+				count := l.streamCount.Load()
+
+				if count > 0 {
+					if opCtx == nil || forceRecreate {
+						startOperation()
+					}
+				} else {
+					stopOperation()
+				}
+
+				// Broadcast current state to ensure any newly registered channels get the initial state
+				l.broadcast(l.isActive.Load())
+
+			case active := <-l.internalStateCh:
+				if l.isActive.Load() != active {
+					l.isActive.Store(active)
+					l.broadcast(active)
+				}
+
+			case <-opDoneCh:
+				// Operation died (e.g. NotFound). Break inner loop to re-ensure subscription.
+				stopOperation()
+				break InnerLoop
 			}
 		}
-
-		l.subReady.Store(true)
-
-		l.streamMu.Lock()
-		if l.streamCount > 0 {
-			l.startOperation()
-		}
-		l.streamMu.Unlock()
-
-		return struct{}{}, nil
 	}
-
-	_, _ = backoff.Retry(context.Background(), operation, backoff.WithBackOff(backoff.NewExponentialBackOff()))
-}
-
-func (l *TopicListener) getSubscription() (*pubsub.Subscription, error) {
-	if !l.subReady.Load() {
-		return nil, fmt.Errorf("subscription not yet created")
-	}
-	return l.config.Client.Subscription(l.config.SubID), nil
-}
-
-func (l *TopicListener) startOperation() {
-	sub, err := l.getSubscription()
-	if err != nil {
-		return
-	}
-
-	l.opCancel()
-	l.opCtx, l.opCancel = context.WithCancel(context.Background())
-
-	timer := time.NewTimer(0)
-	timer.Stop()
-
-	op := &receiveOperation{
-		sub:             sub,
-		topicID:         l.config.TopicID,
-		minHoldDuration: l.config.MinHoldDuration,
-		checkInterval:   l.config.CheckInterval,
-		stateCh:         l.stateCh,
-		onNotFound: func() {
-			l.subReady.Store(false)
-			go l.ensureSubscription()
-		},
-		holdTimer: timer,
-	}
-
-	l.activeOp.Store(op)
-	go op.runWithBackoff(l.opCtx)
 }
 
 func (l *TopicListener) IsActive() bool {
-	op := l.activeOp.Load()
-	if op != nil {
-		return op.IsActive()
-	}
-	return false
+	return l.isActive.Load()
 }
 
 func (s *PubSubScaler) getListener(topicID string) (*TopicListener, error) {
@@ -167,92 +222,44 @@ func (s *PubSubScaler) getListener(topicID string) (*TopicListener, error) {
 }
 
 func (l *TopicListener) register(notifyCh chan bool, holdDuration time.Duration, checkInterval time.Duration) {
-	l.streamMu.Lock()
-	defer l.streamMu.Unlock()
-
 	l.notifyChannels.Store(notifyCh, struct{}{})
 
-	needsRecreate := l.config.UpdateConfig(holdDuration, checkInterval)
-
-	if l.streamCount == 0 || needsRecreate {
-		l.startOperation()
+	if l.config.UpdateConfig(holdDuration, checkInterval) {
+		l.needsRecreate.Store(true)
 	}
-	l.streamCount++
+	l.streamCount.Add(1)
 
-	// Immediately notify the new observer of the current state
-	notifyCh <- l.IsActive()
+	select {
+	case l.reconcileCh <- struct{}{}:
+	default:
+	}
 }
 
 func (l *TopicListener) unregister(notifyCh chan bool) {
-	l.streamMu.Lock()
-	defer l.streamMu.Unlock()
-
 	l.notifyChannels.Delete(notifyCh)
-	l.streamCount--
-	if l.streamCount == 0 {
-		l.opCancel()
+	l.streamCount.Add(-1)
+
+	select {
+	case l.reconcileCh <- struct{}{}:
+	default:
 	}
-}
-
-func (l *TopicListener) broadcastLoop() {
-	for {
-		select {
-		case <-l.stopCh:
-			return
-		case active := <-l.stateCh:
-			l.notifyChannels.Range(func(key, value interface{}) bool {
-				ch := key.(chan bool)
-				select {
-				case ch <- active:
-				default:
-				}
-				return true
-			})
-		}
-	}
-}
-
-func (op *receiveOperation) runWithBackoff(ctx context.Context) {
-	operation := func() (struct{}, error) {
-		return op.run(ctx)
-	}
-
-	_, _ = backoff.Retry(ctx, operation, backoff.WithBackOff(backoff.NewExponentialBackOff()))
-}
-
-func (op *receiveOperation) IsActive() bool {
-	op.stateMu.RLock()
-	defer op.stateMu.RUnlock()
-	return op.active
 }
 
 func (op *receiveOperation) run(ctx context.Context) (struct{}, error) {
-	// Cleanup on error/exit
-	defer func() {
-		op.stateMu.Lock()
-		if op.holdTimer != nil {
-			op.holdTimer.Stop()
-			op.holdTimer = nil
-		}
-		op.stateMu.Unlock()
-	}()
+	defer op.holdTimer.Stop()
 
-	interval := time.Duration(op.checkInterval.Load())
 	op.sub.ReceiveSettings.MaxOutstandingMessages = 1
 	op.sub.ReceiveSettings.NumGoroutines = 1
 	op.sub.ReceiveSettings.Synchronous = true
-	op.sub.ReceiveSettings.MaxExtension = interval + 1*time.Minute
+	op.sub.ReceiveSettings.MaxExtension = op.checkInterval + 1*time.Minute
 
 	err := op.sub.Receive(ctx, op.processMessage)
 
 	if st, _ := status.FromError(err); st.Code() == codes.NotFound {
-		log.Printf("Topic or subscription not found for %s, marking not ready: %v", op.topicID, err)
-		if op.onNotFound != nil {
-			op.onNotFound()
-		}
+		log.Printf("Subscription not found for %s, will recreate: %v", op.sub.ID(), err)
 		return struct{}{}, backoff.Permanent(err)
 	} else if err != nil {
-		log.Printf("Receive error for topic %s: %v, retrying...", op.topicID, err)
+		log.Printf("Receive error for subscription %s: %v, retrying...", op.sub.ID(), err)
 	}
 	return struct{}{}, err
 }
@@ -261,38 +268,32 @@ func (op *receiveOperation) processMessage(c context.Context, msg *pubsub.Messag
 	hold := time.Duration(op.minHoldDuration.Load())
 
 	op.stateMu.Lock()
-	if !op.active {
-		op.active = true
-		select {
-		case op.stateCh <- true:
-		case <-c.Done():
-		}
-		log.Printf("Topic %s ACTIVE", op.topicID)
-	}
-
 	op.lease++
 	currentLease := op.lease
+	op.stateMu.Unlock()
 
-	if op.holdTimer != nil {
-		op.holdTimer.Stop()
-	}
+	op.holdTimer.Stop()
 
 	op.holdTimer = time.AfterFunc(hold, func() {
 		op.stateMu.Lock()
 		defer op.stateMu.Unlock()
 
-		if op.active && op.lease == currentLease {
-			op.active = false
-			op.stateCh <- false
-			log.Printf("Topic %s INACTIVE (idle for %s)", op.topicID, hold)
+		if op.lease == currentLease {
+			select {
+			case op.stateCh <- false:
+			default:
+			}
 		}
 	})
-	op.stateMu.Unlock()
+
+	select {
+	case op.stateCh <- true:
+	case <-c.Done():
+	}
 
 	// Hold the message for the check interval to prevent a tight Nack loop
-	currentInterval := time.Duration(op.checkInterval.Load())
 	select {
-	case <-time.After(currentInterval):
+	case <-time.After(op.checkInterval):
 	case <-c.Done():
 	}
 

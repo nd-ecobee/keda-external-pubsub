@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -62,34 +61,26 @@ func (c *ListenerConfig) UpdateConfig(holdDuration, checkInterval time.Duration)
 
 type TopicListener struct {
 	config ListenerConfig
-	
-	// Channels to notify when active state changes. Key: chan bool, Value: struct{}
+
 	notifyChannels sync.Map
 
-	streamCount int
-	streamMu    sync.Mutex
+	streamCount   atomic.Int32
+	needsRecreate atomic.Bool
+	activeOp      atomic.Pointer[receiveOperation]
 
-	subReady atomic.Bool
+	reconcileCh     chan struct{}
+	internalStateCh chan bool
 
-	activeOp atomic.Pointer[receiveOperation]
-
-	stateCh chan bool
-	stopCh  chan struct{}
-
-	opCtx    context.Context
-	opCancel context.CancelFunc
+	isActive atomic.Bool
 }
 
 type receiveOperation struct {
 	sub             *pubsub.Subscription
-	topicID         string
 	minHoldDuration *atomic.Int64
-	checkInterval   *atomic.Int64
+	checkInterval   time.Duration
 	stateCh         chan<- bool
-	onNotFound      func()
 
-	stateMu   sync.RWMutex
-	active    bool
+	stateMu   sync.Mutex
 	lease     uint64
 	holdTimer *time.Timer
 }
