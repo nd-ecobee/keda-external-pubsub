@@ -47,12 +47,17 @@ func (c *ListenerConfig) UpdateConfig(holdDuration, checkInterval time.Duration)
 	return oldCheck != 0 && oldCheck != newCheck
 }
 
+type stateEvent struct {
+	active bool
+	lease  uint64
+}
 type TopicListener struct {
 	updateConfig   func(time.Duration, time.Duration) bool
 	notifyChannels sync.Map
 	streamCount    atomic.Int32
 	reconcileCh    chan bool
 	isActive       atomic.Bool
+	lease          atomic.Uint64
 
 	runCtx context.Context
 }
@@ -61,9 +66,9 @@ type receiveOperation struct {
 	sub             *pubsub.Subscription
 	minHoldDuration *atomic.Int64
 	checkInterval   time.Duration
-	stateCh         chan<- bool
+	stateCh         chan<- stateEvent
 
-	lease     atomic.Uint64
+	lease     *atomic.Uint64
 	holdTimer *time.Timer
 
 	runCtx context.Context

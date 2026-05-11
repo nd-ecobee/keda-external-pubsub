@@ -80,7 +80,7 @@ func (l *TopicListener) broadcast(active bool) {
 }
 
 func (l *TopicListener) controlLoop(config ListenerConfig) {
-	internalStateCh := make(chan bool)
+	internalStateCh := make(chan stateEvent)
 
 	for {
 		if l.runCtx.Err() != nil {
@@ -120,6 +120,7 @@ func (l *TopicListener) controlLoop(config ListenerConfig) {
 				stateCh:         internalStateCh,
 				holdTimer:       time.NewTimer(0),
 				runCtx:          opCtx,
+				lease:           &l.lease,
 			}
 
 			go func() {
@@ -146,10 +147,10 @@ func (l *TopicListener) controlLoop(config ListenerConfig) {
 					stopOperation()
 				}
 
-			case active := <-internalStateCh:
-				if l.isActive.Load() != active {
-					l.isActive.Store(active)
-					l.broadcast(active)
+			case ev := <-internalStateCh:
+				if ev.lease >= l.lease.Load() && ev.active != l.isActive.Load() {
+					l.isActive.Store(ev.active)
+					l.broadcast(ev.active)
 				}
 
 			case <-opDoneCh:
@@ -237,17 +238,15 @@ func (op *receiveOperation) processMessage(c context.Context, msg *pubsub.Messag
 	op.holdTimer.Stop()
 
 	op.holdTimer = time.AfterFunc(hold, func() {
-		if op.lease.Load() == currentLease {
-			select {
-			case op.stateCh <- false:
-			case <-c.Done():
-			}
+		select {
+		case op.stateCh <- stateEvent{active: false, lease: currentLease}:
+		case <-op.runCtx.Done():
 		}
 	})
 
 	select {
-	case op.stateCh <- true:
-	case <-c.Done():
+	case op.stateCh <- stateEvent{active: true, lease: currentLease}:
+	case <-op.runCtx.Done():
 	}
 
 	// Hold the message for the check interval to prevent a tight Nack loop
