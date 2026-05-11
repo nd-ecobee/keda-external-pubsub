@@ -70,10 +70,10 @@ func (s *PubSubScaler) StreamIsActive(ref *pb.ScaledObjectRef, stream pb.Externa
 	}
 
 	ch := make(chan bool, 1)
-	listener.register(ch, hold, check)
+	listener.Register(ch, hold, check)
 
 	defer func() {
-		listener.unregister(ch)
+		listener.Unregister(ch)
 	}()
 
 	for {

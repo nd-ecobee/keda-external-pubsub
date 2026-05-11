@@ -112,26 +112,18 @@ func (l *TopicListener) controlLoop(config ListenerConfig) {
 			opCtx, opCancel = context.WithCancel(l.runCtx)
 			opDoneCh = make(chan struct{})
 
-			sub := config.Client.Subscription(config.SubID)
-
-			timer := time.NewTimer(0)
-			timer.Stop()
-
 			op := &receiveOperation{
-				sub:             sub,
+				sub:             config.Client.Subscription(config.SubID),
 				minHoldDuration: config.MinHoldDuration,
 				checkInterval:   time.Duration(config.CheckInterval.Load()),
 				stateCh:         internalStateCh,
-				holdTimer:       timer,
+				holdTimer:       time.NewTimer(0),
 				runCtx:          opCtx,
 			}
 
 			go func() {
 				defer close(opDoneCh)
-				runOperation := func() (struct{}, error) {
-					return op.run()
-				}
-				_, _ = backoff.Retry(opCtx, runOperation, backoff.WithBackOff(backoff.NewExponentialBackOff()))
+				_, _ = backoff.Retry(opCtx, op.Run, backoff.WithBackOff(backoff.NewExponentialBackOff()))
 			}()
 		}
 
@@ -147,14 +139,11 @@ func (l *TopicListener) controlLoop(config ListenerConfig) {
 			case needsRecreate := <-l.reconcileCh:
 				count := l.streamCount.Load()
 
-				if count > 0 && (opCtx.Err() != nil || needsRecreate) {
+				if needsRecreate || (count > 0 && opCtx.Err() != nil) {
 					startOperation()
 				} else if count == 0 {
 					stopOperation()
 				}
-
-				// Broadcast current state to ensure any newly registered channels get the initial state
-				l.broadcast(l.isActive.Load())
 
 			case active := <-internalStateCh:
 				if l.isActive.Load() != active {
@@ -200,7 +189,7 @@ func (s *PubSubScaler) getListener(topicID string) (*TopicListener, error) {
 	return l, nil
 }
 
-func (l *TopicListener) register(notifyCh chan bool, holdDuration time.Duration, checkInterval time.Duration) {
+func (l *TopicListener) Register(notifyCh chan bool, holdDuration time.Duration, checkInterval time.Duration) {
 	l.notifyChannels.Store(notifyCh, struct{}{})
 
 	needsRecreate := l.updateConfig(holdDuration, checkInterval)
@@ -213,14 +202,14 @@ func (l *TopicListener) register(notifyCh chan bool, holdDuration time.Duration,
 	}
 }
 
-func (l *TopicListener) unregister(notifyCh chan bool) {
+func (l *TopicListener) Unregister(notifyCh chan bool) {
 	l.notifyChannels.Delete(notifyCh)
 	l.streamCount.Add(-1)
 
 	TrySend(l.reconcileCh, false)
 }
 
-func (op *receiveOperation) run() (struct{}, error) {
+func (op *receiveOperation) Run() (struct{}, error) {
 	defer op.holdTimer.Stop()
 
 	op.sub.ReceiveSettings.MaxOutstandingMessages = 1
@@ -248,7 +237,12 @@ func (op *receiveOperation) processMessage(c context.Context, msg *pubsub.Messag
 
 	op.holdTimer = time.AfterFunc(hold, func() {
 		if op.lease.Load() == currentLease {
-			TrySend(op.stateCh, false)
+			ctx, cancel := context.WithTimeout(op.runCtx, 1*time.Second)
+			defer cancel()
+			select {
+			case op.stateCh <- false:
+			case <-ctx.Done():
+			}
 		}
 	})
 
