@@ -39,14 +39,14 @@ func NewTopicListener(podPSClient *pubsub.Client, topicID string) (*TopicListene
 	ctx := context.Background()
 
 	l := &TopicListener{
-		Client:              podPSClient,
-		Topic:               topic,
-		SubID:               subID,
-		MinDebounceDuration: minDebounce,
-		CheckInterval:       checkInt,
-		ConfigMu:            &sync.Mutex{},
-		reconcileCh:          make(chan bool, 1),
-		runCtx:               ctx,
+		client:              podPSClient,
+		topic:               topic,
+		subID:               subID,
+		minDebounceDuration: minDebounce,
+		checkInterval:       checkInt,
+		configMu:            &sync.Mutex{},
+		reconcileCh:         make(chan bool, 1),
+		runCtx:              ctx,
 	}
 
 	go l.controlLoop()
@@ -55,17 +55,17 @@ func NewTopicListener(podPSClient *pubsub.Client, topicID string) (*TopicListene
 }
 
 func (l *TopicListener) ensureSubscription() error {
-	_, err := l.Client.CreateSubscription(l.runCtx, l.SubID, pubsub.SubscriptionConfig{
-		Topic:            l.Topic,
+	_, err := l.client.CreateSubscription(l.runCtx, l.subID, pubsub.SubscriptionConfig{
+		Topic:            l.topic,
 		ExpirationPolicy: 24 * time.Hour,
 	})
 	if st, _ := status.FromError(err); st.Code() == codes.AlreadyExists {
-		log.Printf("Verified subscription %s exists", l.SubID)
+		log.Printf("Verified subscription %s exists", l.subID)
 		return nil
 	} else if err != nil {
-		log.Printf("Warning: failed to create subscription %s, retrying: %v", l.SubID, err)
+		log.Printf("Warning: failed to create subscription %s, retrying: %v", l.subID, err)
 	} else {
-		log.Printf("Successfully created subscription %s", l.SubID)
+		log.Printf("Successfully created subscription %s", l.subID)
 	}
 	return err
 }
@@ -75,7 +75,8 @@ func (l *TopicListener) setActive(active bool) {
 		return
 	}
 	l.isActive.Store(active)
-	l.notifyChannels.Range(func(key, value interface{}) bool {
+	log.Printf("Topic %s: %v", l.topic.String(), active)
+	l.notifyChannels.Range(func(key, value any) bool {
 		ch := key.(chan bool)
 		TrySend(ch, active)
 		return true
@@ -89,7 +90,7 @@ func (l *TopicListener) controlLoop() {
 
 	for {
 		if l.runCtx.Err() != nil {
-			log.Printf("TopicListener control loop exiting: %v", l.runCtx.Err())
+			log.Printf("TopicListener control loop exiting for topic %s: %v", l.topic.String(), l.runCtx.Err())
 			return
 		}
 
@@ -99,7 +100,7 @@ func (l *TopicListener) controlLoop() {
 
 		_, err := backoff.Retry(l.runCtx, operation, backoff.WithBackOff(backoff.NewExponentialBackOff()))
 		if err != nil {
-			log.Printf("TopicListener control loop exiting due to backoff error: %v", err)
+			log.Printf("TopicListener control loop exiting for topic %s due to backoff error: %v", l.topic.String(), err)
 			return // runCtx canceled
 		}
 
@@ -112,15 +113,14 @@ func (l *TopicListener) controlLoop() {
 			opCancel()
 			<-opDoneCh
 		}
-
 		startOperation := func() {
 			stopOperation()
 			opCtx, opCancel = context.WithCancel(l.runCtx)
 			opDoneCh = make(chan any)
 
 			op := &receiveOperation{
-				sub:           l.Client.Subscription(l.SubID),
-				checkInterval: time.Duration(l.CheckInterval.Load()),
+				sub:           l.client.Subscription(l.subID),
+				checkInterval: time.Duration(l.checkInterval.Load()),
 				messageTick:   messageTick,
 				runCtx:        opCtx,
 			}
@@ -151,7 +151,7 @@ func (l *TopicListener) controlLoop() {
 
 			case <-messageTick:
 				l.setActive(true)
-				holdTimer.Reset(time.Duration(l.MinDebounceDuration.Load()))
+				holdTimer.Reset(time.Duration(l.minDebounceDuration.Load()))
 
 			case <-holdTimer.C:
 				l.setActive(false)
@@ -180,6 +180,7 @@ func (s *PubSubScaler) getListener(topicID string) (*TopicListener, error) {
 	s.listenersMu.Lock()
 	defer s.listenersMu.Unlock()
 
+	// Double-check after acquiring write lock
 	if l, ok := s.listeners[topicID]; ok {
 		return l, nil
 	}
@@ -233,11 +234,14 @@ func (op *receiveOperation) processMessage(c context.Context, msg *pubsub.Messag
 	case <-op.runCtx.Done():
 	}
 
+	// Hold the message for the check interval to prevent a tight Nack loop
 	select {
 	case <-time.After(op.checkInterval):
 	case <-c.Done():
 	}
 
+	// Purge the backlog right before Nacking. This clears the client buffer
+	// and ensures the next poll is for fresh activity.
 	op.purge()
 	msg.Nack()
 	log.Printf("Nacked message %s on subscription %s", msg.ID, op.sub.ID())
@@ -245,6 +249,7 @@ func (op *receiveOperation) processMessage(c context.Context, msg *pubsub.Messag
 
 func (op *receiveOperation) purge() {
 	log.Printf("Purging backlog for subscription %s", op.sub.ID())
+	// The shared runCtx handles scaler teardown, plus a timeout so SeekToTime doesn't block indefinitely
 	ctx, cancel := context.WithTimeout(op.runCtx, 5*time.Second)
 	defer cancel()
 	if err := op.sub.SeekToTime(ctx, time.Now()); err != nil {

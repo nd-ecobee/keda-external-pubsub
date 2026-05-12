@@ -24,12 +24,12 @@ type PubSubScaler struct {
 }
 
 type TopicListener struct {
-	Client              *pubsub.Client
-	Topic               *pubsub.Topic
-	SubID               string
-	MinDebounceDuration *atomic.Int64
-	CheckInterval       *atomic.Int64
-	ConfigMu            *sync.Mutex
+	client              *pubsub.Client
+	topic               *pubsub.Topic
+	subID               string
+	minDebounceDuration *atomic.Int64
+	checkInterval       *atomic.Int64
+	configMu            *sync.Mutex
 
 	notifyChannels sync.Map
 	streamCount    atomic.Int32
@@ -40,16 +40,16 @@ type TopicListener struct {
 }
 
 func (l *TopicListener) updateConfig(debounceDuration, checkInterval time.Duration) bool {
-	l.ConfigMu.Lock()
-	defer l.ConfigMu.Unlock()
+	l.configMu.Lock()
+	defer l.configMu.Unlock()
 
-	currentMin := time.Duration(l.MinDebounceDuration.Load())
+	currentMin := time.Duration(l.minDebounceDuration.Load())
 	effectiveDebounce := max(30*time.Second, debounceDuration)
-	l.MinDebounceDuration.Store(int64(min(currentMin, effectiveDebounce)))
+	l.minDebounceDuration.Store(int64(min(currentMin, effectiveDebounce)))
 
-	currentCheck := time.Duration(l.CheckInterval.Load())
+	currentCheck := time.Duration(l.checkInterval.Load())
 	newCheck := int64(min(currentCheck, checkInterval))
-	oldCheck := l.CheckInterval.Swap(newCheck)
+	oldCheck := l.checkInterval.Swap(newCheck)
 
 	return oldCheck != 0 && oldCheck != newCheck
 }
