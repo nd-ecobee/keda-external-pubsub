@@ -24,12 +24,12 @@ type PubSubScaler struct {
 }
 
 type ListenerConfig struct {
-	Client              *pubsub.Client
-	Topic               *pubsub.Topic
-	SubID               string
+	Client          *pubsub.Client
+	Topic           *pubsub.Topic
+	SubID           string
 	MinDebounceDuration *atomic.Int64
-	CheckInterval       *atomic.Int64
-	ConfigMu            *sync.Mutex
+	CheckInterval   *atomic.Int64
+	ConfigMu        *sync.Mutex
 }
 
 func (c *ListenerConfig) UpdateConfig(debounceDuration, checkInterval time.Duration) bool {
@@ -61,7 +61,7 @@ type receiveOperation struct {
 	sub                 *pubsub.Subscription
 	minDebounceDuration *atomic.Int64
 	checkInterval       time.Duration
-	messageTick         chan<- struct{}
+	messageTick         chan<- any
 
 	runCtx context.Context
 }

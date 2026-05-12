@@ -87,9 +87,9 @@ func (l *TopicListener) setActive(active bool) {
 }
 
 func (l *TopicListener) controlLoop(config ListenerConfig) {
-	messageTick := make(chan struct{})
-	debounceTimer := time.NewTimer(time.Hour)
-	debounceTimer.Stop()
+	messageTick := make(chan any)
+	holdTimer := time.NewTimer(time.Hour)
+	holdTimer.Stop()
 
 	for {
 		if l.runCtx.Err() != nil {
@@ -97,8 +97,8 @@ func (l *TopicListener) controlLoop(config ListenerConfig) {
 			return
 		}
 
-		operation := func() (struct{}, error) {
-			return struct{}{}, l.ensureSubscription(config)
+		operation := func() (any, error) {
+			return nil, l.ensureSubscription(config)
 		}
 
 		_, err := backoff.Retry(l.runCtx, operation, backoff.WithBackOff(backoff.NewExponentialBackOff()))
@@ -109,7 +109,7 @@ func (l *TopicListener) controlLoop(config ListenerConfig) {
 
 		opCtx, opCancel := context.WithCancel(context.Background())
 		opCancel() // start canceled
-		opDoneCh := make(chan struct{})
+		opDoneCh := make(chan any)
 		close(opDoneCh)
 
 		stopOperation := func() {
@@ -119,7 +119,7 @@ func (l *TopicListener) controlLoop(config ListenerConfig) {
 		startOperation := func() {
 			stopOperation()
 			opCtx, opCancel = context.WithCancel(l.runCtx)
-			opDoneCh = make(chan struct{})
+			opDoneCh = make(chan any)
 
 			op := &receiveOperation{
 				sub:                 config.Client.Subscription(config.SubID),
@@ -155,9 +155,9 @@ func (l *TopicListener) controlLoop(config ListenerConfig) {
 
 			case <-messageTick:
 				l.setActive(true)
-				debounceTimer.Reset(time.Duration(config.MinDebounceDuration.Load()))
+				holdTimer.Reset(time.Duration(config.MinDebounceDuration.Load()))
 
-			case <-debounceTimer.C:
+			case <-holdTimer.C:
 				l.setActive(false)
 
 			case <-opDoneCh:
@@ -199,7 +199,7 @@ func (s *PubSubScaler) getListener(topicID string) (*TopicListener, error) {
 }
 
 func (l *TopicListener) Register(notifyCh chan bool, holdDuration time.Duration, checkInterval time.Duration) {
-	l.notifyChannels.Store(notifyCh, struct{}{})
+	l.notifyChannels.Store(notifyCh, nil)
 
 	needsRecreate := l.updateConfig(holdDuration, checkInterval)
 	l.streamCount.Add(1)
@@ -218,7 +218,7 @@ func (l *TopicListener) Unregister(notifyCh chan bool) {
 	TrySend(l.reconcileCh, false)
 }
 
-func (op *receiveOperation) Run() (struct{}, error) {
+func (op *receiveOperation) Run() (any, error) {
 	log.Printf("Starting stream pull for subscription %s", op.sub.ID())
 	defer log.Printf("Stream pull for subscription %s stopped", op.sub.ID())
 
@@ -227,14 +227,14 @@ func (op *receiveOperation) Run() (struct{}, error) {
 	op.sub.ReceiveSettings.Synchronous = true
 	op.sub.ReceiveSettings.MaxExtension = op.checkInterval + 1*time.Minute
 
-	return struct{}{}, op.sub.Receive(op.runCtx, op.processMessage)
+	return nil, op.sub.Receive(op.runCtx, op.processMessage)
 }
 
 func (op *receiveOperation) processMessage(c context.Context, msg *pubsub.Message) {
 	log.Printf("Received message %s on subscription %s", msg.ID, op.sub.ID())
 
 	select {
-	case op.messageTick <- struct{}{}:
+	case op.messageTick <- nil:
 	case <-op.runCtx.Done():
 	}
 
