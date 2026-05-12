@@ -23,32 +23,14 @@ type PubSubScaler struct {
 	listenersMu sync.RWMutex
 }
 
-type ListenerConfig struct {
-	Client          *pubsub.Client
-	Topic           *pubsub.Topic
-	SubID           string
-	MinDebounceDuration *atomic.Int64
-	CheckInterval   *atomic.Int64
-	ConfigMu        *sync.Mutex
-}
-
-func (c *ListenerConfig) UpdateConfig(debounceDuration, checkInterval time.Duration) bool {
-	c.ConfigMu.Lock()
-	defer c.ConfigMu.Unlock()
-
-	currentMin := time.Duration(c.MinDebounceDuration.Load())
-	effectiveDebounce := max(30*time.Second, debounceDuration)
-	c.MinDebounceDuration.Store(int64(min(currentMin, effectiveDebounce)))
-
-	currentCheck := time.Duration(c.CheckInterval.Load())
-	newCheck := int64(min(currentCheck, checkInterval))
-	oldCheck := c.CheckInterval.Swap(newCheck)
-
-	return oldCheck != 0 && oldCheck != newCheck
-}
-
 type TopicListener struct {
-	updateConfig   func(time.Duration, time.Duration) bool
+	Client              *pubsub.Client
+	Topic               *pubsub.Topic
+	SubID               string
+	MinDebounceDuration *atomic.Int64
+	CheckInterval       *atomic.Int64
+	ConfigMu            *sync.Mutex
+
 	notifyChannels sync.Map
 	streamCount    atomic.Int32
 	reconcileCh    chan bool
@@ -57,11 +39,25 @@ type TopicListener struct {
 	runCtx context.Context
 }
 
+func (l *TopicListener) updateConfig(debounceDuration, checkInterval time.Duration) bool {
+	l.ConfigMu.Lock()
+	defer l.ConfigMu.Unlock()
+
+	currentMin := time.Duration(l.MinDebounceDuration.Load())
+	effectiveDebounce := max(30*time.Second, debounceDuration)
+	l.MinDebounceDuration.Store(int64(min(currentMin, effectiveDebounce)))
+
+	currentCheck := time.Duration(l.CheckInterval.Load())
+	newCheck := int64(min(currentCheck, checkInterval))
+	oldCheck := l.CheckInterval.Swap(newCheck)
+
+	return oldCheck != 0 && oldCheck != newCheck
+}
+
 type receiveOperation struct {
-	sub                 *pubsub.Subscription
-	minDebounceDuration *atomic.Int64
-	checkInterval       time.Duration
-	messageTick         chan<- any
+	sub           *pubsub.Subscription
+	checkInterval time.Duration
+	messageTick   chan<- any
 
 	runCtx context.Context
 }
