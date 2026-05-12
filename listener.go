@@ -16,6 +16,22 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+type TopicListener struct {
+	client              *pubsub.Client
+	topic               *pubsub.Topic
+	subID               string
+	minDebounceDuration *atomic.Int64
+	checkInterval       *atomic.Int64
+	configMu            *sync.Mutex
+
+	notifyChannels sync.Map
+	streamCount    atomic.Int32
+	reconcileCh    chan bool
+	isActive       atomic.Bool
+
+	runCtx context.Context
+}
+
 func NewTopicListener(podPSClient *pubsub.Client, topicID string) (*TopicListener, error) {
 	topicParts := splitGCPResource(topicID)
 	if len(topicParts) != 4 {
@@ -52,6 +68,21 @@ func NewTopicListener(podPSClient *pubsub.Client, topicID string) (*TopicListene
 	go l.controlLoop()
 
 	return l, nil
+}
+
+func (l *TopicListener) updateConfig(debounceDuration, checkInterval time.Duration) bool {
+	l.configMu.Lock()
+	defer l.configMu.Unlock()
+
+	currentMin := time.Duration(l.minDebounceDuration.Load())
+	effectiveDebounce := max(30*time.Second, debounceDuration)
+	l.minDebounceDuration.Store(int64(min(currentMin, effectiveDebounce)))
+
+	currentCheck := time.Duration(l.checkInterval.Load())
+	newCheck := int64(min(currentCheck, checkInterval))
+	oldCheck := l.checkInterval.Swap(newCheck)
+
+	return oldCheck != 0 && oldCheck != newCheck
 }
 
 func (l *TopicListener) ensureSubscription() error {
@@ -118,7 +149,7 @@ func (l *TopicListener) controlLoop() {
 			opCtx, opCancel = context.WithCancel(l.runCtx)
 			opDoneCh = make(chan any)
 
-			op := &receiveOperation{
+			sub := &topicSubscription{
 				sub:           l.client.Subscription(l.subID),
 				checkInterval: time.Duration(l.checkInterval.Load()),
 				messageTick:   messageTick,
@@ -127,7 +158,7 @@ func (l *TopicListener) controlLoop() {
 
 			go func() {
 				defer close(opDoneCh)
-				_, _ = backoff.Retry(opCtx, op.Run, backoff.WithBackOff(backoff.NewExponentialBackOff()))
+				_, _ = backoff.Retry(opCtx, sub.Run, backoff.WithBackOff(backoff.NewExponentialBackOff()))
 			}()
 		}
 
@@ -169,31 +200,6 @@ func (l *TopicListener) IsActive() bool {
 	return l.isActive.Load()
 }
 
-func (s *PubSubScaler) getListener(topicID string) (*TopicListener, error) {
-	s.listenersMu.RLock()
-	if l, ok := s.listeners[topicID]; ok {
-		s.listenersMu.RUnlock()
-		return l, nil
-	}
-	s.listenersMu.RUnlock()
-
-	s.listenersMu.Lock()
-	defer s.listenersMu.Unlock()
-
-	// Double-check after acquiring write lock
-	if l, ok := s.listeners[topicID]; ok {
-		return l, nil
-	}
-
-	l, err := NewTopicListener(s.podPSClient, topicID)
-	if err != nil {
-		return nil, err
-	}
-
-	s.listeners[topicID] = l
-	return l, nil
-}
-
 func (l *TopicListener) Register(notifyCh chan bool, debounceDuration time.Duration, checkInterval time.Duration) {
 	l.notifyChannels.Store(notifyCh, nil)
 
@@ -212,47 +218,4 @@ func (l *TopicListener) Unregister(notifyCh chan bool) {
 	l.streamCount.Add(-1)
 
 	TrySend(l.reconcileCh, false)
-}
-
-func (op *receiveOperation) Run() (any, error) {
-	log.Printf("Starting stream pull for subscription %s", op.sub.ID())
-	defer log.Printf("Stream pull for subscription %s stopped", op.sub.ID())
-
-	op.sub.ReceiveSettings.MaxOutstandingMessages = 1
-	op.sub.ReceiveSettings.NumGoroutines = 1
-	op.sub.ReceiveSettings.Synchronous = true
-	op.sub.ReceiveSettings.MaxExtension = op.checkInterval + 1*time.Minute
-
-	return nil, op.sub.Receive(op.runCtx, op.processMessage)
-}
-
-func (op *receiveOperation) processMessage(c context.Context, msg *pubsub.Message) {
-	log.Printf("Received message %s on subscription %s", msg.ID, op.sub.ID())
-
-	select {
-	case op.messageTick <- nil:
-	case <-op.runCtx.Done():
-	}
-
-	// Hold the message for the check interval to prevent a tight Nack loop
-	select {
-	case <-time.After(op.checkInterval):
-	case <-c.Done():
-	}
-
-	// Purge the backlog right before Nacking. This clears the client buffer
-	// and ensures the next poll is for fresh activity.
-	op.purge()
-	msg.Nack()
-	log.Printf("Nacked message %s on subscription %s", msg.ID, op.sub.ID())
-}
-
-func (op *receiveOperation) purge() {
-	log.Printf("Purging backlog for subscription %s", op.sub.ID())
-	// The shared runCtx handles scaler teardown, plus a timeout so SeekToTime doesn't block indefinitely
-	ctx, cancel := context.WithTimeout(op.runCtx, 5*time.Second)
-	defer cancel()
-	if err := op.sub.SeekToTime(ctx, time.Now()); err != nil {
-		log.Printf("Error purging sub %s: %v", op.sub.ID(), err)
-	}
 }

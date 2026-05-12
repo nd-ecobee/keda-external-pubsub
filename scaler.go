@@ -4,12 +4,25 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"strings"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/pubsub"
 	pb "github.com/kedacore/keda/v2/pkg/scalers/externalscaler"
 )
+
+const (
+	MetricHasPendingMessage = "has_pending_message"
+)
+
+type PubSubScaler struct {
+	pb.UnimplementedExternalScalerServer
+
+	podPSClient *pubsub.Client
+
+	listeners   map[string]*TopicListener
+	listenersMu sync.RWMutex
+}
 
 func NewPubSubScaler() *PubSubScaler {
 	ctx := context.Background()
@@ -51,10 +64,6 @@ func (s *PubSubScaler) getListenerWithMeta(meta map[string]string) (*TopicListen
 	return listener, debounce, check, nil
 }
 
-func splitGCPResource(res string) []string {
-	return strings.Split(res, "/")
-}
-
 func (s *PubSubScaler) IsActive(ctx context.Context, ref *pb.ScaledObjectRef) (*pb.IsActiveResponse, error) {
 	log.Printf("RPC IsActive for %s", ref.Name)
 	listener, _, _, err := s.getListenerWithMeta(ref.ScalerMetadata)
@@ -68,13 +77,13 @@ func (s *PubSubScaler) IsActive(ctx context.Context, ref *pb.ScaledObjectRef) (*
 
 func (s *PubSubScaler) StreamIsActive(ref *pb.ScaledObjectRef, stream pb.ExternalScaler_StreamIsActiveServer) error {
 	log.Printf("RPC StreamIsActive started for %s", ref.Name)
-	listener, hold, check, err := s.getListenerWithMeta(ref.ScalerMetadata)
+	listener, debounce, check, err := s.getListenerWithMeta(ref.ScalerMetadata)
 	if err != nil {
 		return err
 	}
 
 	ch := make(chan bool, 1)
-	listener.Register(ch, hold, check)
+	listener.Register(ch, debounce, check)
 
 	defer func() {
 		listener.Unregister(ch)
@@ -127,4 +136,29 @@ func (s *PubSubScaler) GetMetrics(ctx context.Context, req *pb.GetMetricsRequest
 			},
 		},
 	}, nil
+}
+
+func (s *PubSubScaler) getListener(topicID string) (*TopicListener, error) {
+	s.listenersMu.RLock()
+	if l, ok := s.listeners[topicID]; ok {
+		s.listenersMu.RUnlock()
+		return l, nil
+	}
+	s.listenersMu.RUnlock()
+
+	s.listenersMu.Lock()
+	defer s.listenersMu.Unlock()
+
+	// Double-check after acquiring write lock
+	if l, ok := s.listeners[topicID]; ok {
+		return l, nil
+	}
+
+	l, err := NewTopicListener(s.podPSClient, topicID)
+	if err != nil {
+		return nil, err
+	}
+
+	s.listeners[topicID] = l
+	return l, nil
 }
