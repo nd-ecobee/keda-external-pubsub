@@ -24,21 +24,21 @@ type PubSubScaler struct {
 }
 
 type ListenerConfig struct {
-	Client          *pubsub.Client
-	Topic           *pubsub.Topic
-	SubID           string
-	MinHoldDuration *atomic.Int64
-	CheckInterval   *atomic.Int64
-	ConfigMu        *sync.Mutex
+	Client              *pubsub.Client
+	Topic               *pubsub.Topic
+	SubID               string
+	MinDebounceDuration *atomic.Int64
+	CheckInterval       *atomic.Int64
+	ConfigMu            *sync.Mutex
 }
 
-func (c *ListenerConfig) UpdateConfig(holdDuration, checkInterval time.Duration) bool {
+func (c *ListenerConfig) UpdateConfig(debounceDuration, checkInterval time.Duration) bool {
 	c.ConfigMu.Lock()
 	defer c.ConfigMu.Unlock()
 
-	currentMin := time.Duration(c.MinHoldDuration.Load())
-	effectiveHold := max(30*time.Second, holdDuration)
-	c.MinHoldDuration.Store(int64(min(currentMin, effectiveHold)))
+	currentMin := time.Duration(c.MinDebounceDuration.Load())
+	effectiveDebounce := max(30*time.Second, debounceDuration)
+	c.MinDebounceDuration.Store(int64(min(currentMin, effectiveDebounce)))
 
 	currentCheck := time.Duration(c.CheckInterval.Load())
 	newCheck := int64(min(currentCheck, checkInterval))
@@ -47,29 +47,21 @@ func (c *ListenerConfig) UpdateConfig(holdDuration, checkInterval time.Duration)
 	return oldCheck != 0 && oldCheck != newCheck
 }
 
-type stateEvent struct {
-	active bool
-	lease  uint64
-}
 type TopicListener struct {
 	updateConfig   func(time.Duration, time.Duration) bool
 	notifyChannels sync.Map
 	streamCount    atomic.Int32
 	reconcileCh    chan bool
 	isActive       atomic.Bool
-	lease          atomic.Uint64
 
 	runCtx context.Context
 }
 
 type receiveOperation struct {
-	sub             *pubsub.Subscription
-	minHoldDuration *atomic.Int64
-	checkInterval   time.Duration
-	stateCh         chan<- stateEvent
-
-	lease     *atomic.Uint64
-	holdTimer *time.Timer
+	sub                 *pubsub.Subscription
+	minDebounceDuration *atomic.Int64
+	checkInterval       time.Duration
+	messageTick         chan<- struct{}
 
 	runCtx context.Context
 }

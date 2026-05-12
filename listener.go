@@ -31,18 +31,18 @@ func NewTopicListener(podPSClient *pubsub.Client, topicID string) (*TopicListene
 
 	topic := podPSClient.TopicInProject(topicName, topicProject)
 
-	minHold := &atomic.Int64{}
-	minHold.Store(int64(5 * time.Minute))
+	minDebounce := &atomic.Int64{}
+	minDebounce.Store(int64(5 * time.Minute))
 	checkInt := &atomic.Int64{}
 	checkInt.Store(int64(1 * time.Minute))
 
 	config := ListenerConfig{
-		Client:          podPSClient,
-		Topic:           topic,
-		SubID:           subID,
-		MinHoldDuration: minHold,
-		CheckInterval:   checkInt,
-		ConfigMu:        &sync.Mutex{},
+		Client:              podPSClient,
+		Topic:               topic,
+		SubID:               subID,
+		MinDebounceDuration: minDebounce,
+		CheckInterval:       checkInt,
+		ConfigMu:            &sync.Mutex{},
 	}
 
 	ctx := context.Background()
@@ -74,7 +74,11 @@ func (l *TopicListener) ensureSubscription(config ListenerConfig) error {
 	return err
 }
 
-func (l *TopicListener) broadcast(active bool) {
+func (l *TopicListener) setActive(active bool) {
+	if active == l.isActive.Load() {
+		return
+	}
+	l.isActive.Store(active)
 	l.notifyChannels.Range(func(key, value interface{}) bool {
 		ch := key.(chan bool)
 		TrySend(ch, active)
@@ -83,22 +87,23 @@ func (l *TopicListener) broadcast(active bool) {
 }
 
 func (l *TopicListener) controlLoop(config ListenerConfig) {
-	internalStateCh := make(chan stateEvent)
+	messageTick := make(chan struct{})
+	debounceTimer := time.NewTimer(time.Hour)
+	debounceTimer.Stop()
 
 	for {
 		if l.runCtx.Err() != nil {
-			log.Printf("TopicListener control loop exiting for topic %s: %v", config.Topic.String(), l.runCtx.Err())
+			log.Printf("TopicListener control loop exiting: %v", l.runCtx.Err())
 			return
 		}
 
-		// 1. Single retry call to ensureSubscription
 		operation := func() (struct{}, error) {
 			return struct{}{}, l.ensureSubscription(config)
 		}
 
 		_, err := backoff.Retry(l.runCtx, operation, backoff.WithBackOff(backoff.NewExponentialBackOff()))
 		if err != nil {
-			log.Printf("TopicListener control loop exiting for topic %s due to backoff error: %v", config.Topic.String(), err)
+			log.Printf("TopicListener control loop exiting due to backoff error: %v", err)
 			return // runCtx canceled
 		}
 
@@ -117,13 +122,11 @@ func (l *TopicListener) controlLoop(config ListenerConfig) {
 			opDoneCh = make(chan struct{})
 
 			op := &receiveOperation{
-				sub:             config.Client.Subscription(config.SubID),
-				minHoldDuration: config.MinHoldDuration,
-				checkInterval:   time.Duration(config.CheckInterval.Load()),
-				stateCh:         internalStateCh,
-				holdTimer:       time.NewTimer(0),
-				runCtx:          opCtx,
-				lease:           &l.lease,
+				sub:                 config.Client.Subscription(config.SubID),
+				minDebounceDuration: config.MinDebounceDuration,
+				checkInterval:       time.Duration(config.CheckInterval.Load()),
+				messageTick:         messageTick,
+				runCtx:              opCtx,
 			}
 
 			go func() {
@@ -150,12 +153,12 @@ func (l *TopicListener) controlLoop(config ListenerConfig) {
 					stopOperation()
 				}
 
-			case ev := <-internalStateCh:
-				log.Printf("Topic %s: %v (lease %d)", config.Topic.String(), ev.active, ev.lease)
-				if ev.lease >= l.lease.Load() && ev.active != l.isActive.Load() {
-					l.isActive.Store(ev.active)
-					l.broadcast(ev.active)
-				}
+			case <-messageTick:
+				l.setActive(true)
+				debounceTimer.Reset(time.Duration(config.MinDebounceDuration.Load()))
+
+			case <-debounceTimer.C:
+				l.setActive(false)
 
 			case <-opDoneCh:
 				// Operation died (e.g. NotFound). Break inner loop to re-ensure subscription.
@@ -217,44 +220,21 @@ func (l *TopicListener) Unregister(notifyCh chan bool) {
 
 func (op *receiveOperation) Run() (struct{}, error) {
 	log.Printf("Starting stream pull for subscription %s", op.sub.ID())
-	defer func() {
-		op.holdTimer.Stop()
-		log.Printf("Stream pull for subscription %s stopped", op.sub.ID())
-	}()
+	defer log.Printf("Stream pull for subscription %s stopped", op.sub.ID())
 
 	op.sub.ReceiveSettings.MaxOutstandingMessages = 1
 	op.sub.ReceiveSettings.NumGoroutines = 1
 	op.sub.ReceiveSettings.Synchronous = true
 	op.sub.ReceiveSettings.MaxExtension = op.checkInterval + 1*time.Minute
 
-	err := op.sub.Receive(op.runCtx, op.processMessage)
-
-	if st, _ := status.FromError(err); st.Code() == codes.NotFound {
-		log.Printf("Subscription not found for %s, will recreate: %v", op.sub.ID(), err)
-		return struct{}{}, backoff.Permanent(err)
-	} else if err != nil {
-		log.Printf("Receive error for subscription %s: %v, retrying...", op.sub.ID(), err)
-	}
-	return struct{}{}, err
+	return struct{}{}, op.sub.Receive(op.runCtx, op.processMessage)
 }
 
 func (op *receiveOperation) processMessage(c context.Context, msg *pubsub.Message) {
 	log.Printf("Received message %s on subscription %s", msg.ID, op.sub.ID())
-	hold := time.Duration(op.minHoldDuration.Load())
-
-	currentLease := op.lease.Add(1)
-
-	op.holdTimer.Stop()
-
-	op.holdTimer = time.AfterFunc(hold, func() {
-		select {
-		case op.stateCh <- stateEvent{active: false, lease: currentLease}:
-		case <-op.runCtx.Done():
-		}
-	})
 
 	select {
-	case op.stateCh <- stateEvent{active: true, lease: currentLease}:
+	case op.messageTick <- struct{}{}:
 	case <-op.runCtx.Done():
 	}
 

@@ -26,16 +26,16 @@ func NewPubSubScaler() *PubSubScaler {
 
 func (s *PubSubScaler) getListenerWithMeta(meta map[string]string) (*TopicListener, time.Duration, time.Duration, error) {
 	topicID := meta["topic"]
-	holdStr := meta["holdDuration"]
+	debounceStr := meta["debounceDuration"]
 	checkStr := meta["checkInterval"]
 
 	if topicID == "" {
 		return nil, 0, 0, fmt.Errorf("topic is required in metadata")
 	}
 
-	hold, err := time.ParseDuration(holdStr)
+	debounce, err := time.ParseDuration(debounceStr)
 	if err != nil {
-		hold = 5 * time.Minute // Default hold duration 5m
+		debounce = 5 * time.Minute // Default debounce duration 5m
 	}
 
 	check, err := time.ParseDuration(checkStr)
@@ -48,7 +48,7 @@ func (s *PubSubScaler) getListenerWithMeta(meta map[string]string) (*TopicListen
 		return nil, 0, 0, err
 	}
 
-	return listener, hold, check, nil
+	return listener, debounce, check, nil
 }
 
 func splitGCPResource(res string) []string {
